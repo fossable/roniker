@@ -1,8 +1,8 @@
 use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use crate::tree_sitter_parser;
 use std::sync::Arc;
-use tower_lsp::lsp_types::*;
 use tower_lsp::Client;
+use tower_lsp::lsp_types::*;
 
 /// Generate all code actions for a RON document
 pub async fn generate_code_actions(
@@ -973,7 +973,6 @@ mod tests {
             client: client.clone(),
             documents: Default::default(),
             rust_analyzer: analyzer.clone(),
-            config: Arc::new(Default::default()),
         });
         let client = service.inner().client.clone();
 

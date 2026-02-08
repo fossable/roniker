@@ -1,7 +1,6 @@
 mod annotation_parser;
 mod code_actions;
 mod completion;
-mod config;
 mod diagnostic_reporter;
 mod diagnostics;
 mod format;
@@ -9,10 +8,8 @@ pub mod rust_analyzer;
 mod tree_sitter_parser;
 mod ts_utils;
 
-pub use config::{Config, TypePattern};
 pub use rust_analyzer::RustAnalyzer;
 
-use crate::config::CONFIG_FILE_NAME;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,7 +31,6 @@ pub struct Backend {
     pub client: Client,
     pub documents: Arc<RwLock<HashMap<String, Document>>>,
     pub rust_analyzer: Arc<rust_analyzer::RustAnalyzer>,
-    pub config: Arc<RwLock<Config>>,
 }
 
 impl Backend {
@@ -43,152 +39,12 @@ impl Backend {
             client,
             documents: Arc::new(RwLock::new(HashMap::new())),
             rust_analyzer: Arc::new(rust_analyzer::RustAnalyzer::new()),
-            config: Arc::new(RwLock::new(Config::default())),
         }
     }
 
-    async fn initialize_config<P: AsRef<Path>>(
-        &self,
-        initialization_options: Option<&serde_json::Value>,
-        dir: P,
-    ) {
-        // Try to get config from initialization_options first
-        let c = match initialization_options
-            .map(|options| serde_json::from_value::<Config>(options.clone()))
-        {
-            Some(Ok(c)) => Some(c),
-            Some(Err(err)) => {
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("Failed to retrieve config from client: {err}"),
-                    )
-                    .await;
-                None
-            }
-            None => None,
-        };
-
-        // Then try to load from ron.toml file
-        let c = if c.is_some() {
-            c
-        } else {
-            self.load_config_from_file(dir).await.ok().flatten()
-        };
-
-        // Only overwrite if we found a config from initialization_options or ron.toml
-        if let Some(c) = c {
-            let mut config = self.config.write().await;
-            *config = c;
-        }
-    }
-
-    async fn load_config_from_file<P: AsRef<Path>>(
-        &self,
-        dir: P,
-    ) -> anyhow::Result<Option<Config>> {
-        match Config::try_load_from_dir(dir) {
-            Ok(Some(config)) => {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("Loaded {CONFIG_FILE_NAME} config file."),
-                    )
-                    .await;
-                self.client
-                    .log_message(MessageType::INFO, format!("{config:?}"))
-                    .await;
-                Ok(Some(config))
-            }
-            Ok(None) => {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("No {CONFIG_FILE_NAME} config file found."),
-                    )
-                    .await;
-                Ok(None)
-            }
-            Err(err) => {
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("Failed to load ron.toml config: {err}"),
-                    )
-                    .await;
-                Err(err)
-            }
-        }
-    }
-
+    // TODO remove
     async fn get_type_annotation(&self, content: &str, uri: &Url) -> Option<String> {
-        match annotation_parser::parse_type_annotation(content) {
-            Some(type_annotation) => Some(type_annotation),
-            None => {
-                let file_path = uri.to_file_path().ok()?;
-                let config = self.config.read().await;
-                config.match_module_path(&file_path).cloned()
-            }
-        }
-    }
-
-    async fn register_config_file_watching(&self) -> anyhow::Result<()> {
-        let options = DidChangeWatchedFilesRegistrationOptions {
-            watchers: vec![FileSystemWatcher {
-                glob_pattern: GlobPattern::String(format!("**/{CONFIG_FILE_NAME}").into()),
-                kind: None,
-            }],
-        };
-
-        let r = Ok(self
-            .client
-            .register_capability(vec![Registration {
-                id: "ron-toml-watcher".to_string(),
-                method: "workspace/didChangeWatchedFiles".to_string(),
-                register_options: Some(serde_json::to_value(options)?),
-            }])
-            .await?);
-
-        if r.is_ok() {
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!("Watching {CONFIG_FILE_NAME} for changes."),
-                )
-                .await;
-        }
-
-        r
-    }
-
-    async fn config_file_changed(&self) {
-        let dir = {
-            let config = self.config.read().await;
-            let Some(dir) = config.root_dir.clone() else {
-                return;
-            };
-
-            dir
-        };
-
-        self.client
-            .log_message(
-                MessageType::INFO,
-                format!(
-                    "{CONFIG_FILE_NAME} changed, reloading config at {}.",
-                    dir.display()
-                ),
-            )
-            .await;
-
-        if let Ok(Some(c)) = self.load_config_from_file(dir).await {
-            let mut config = self.config.write().await;
-            *config = c;
-
-            self.client
-                .log_message(MessageType::INFO, "New configuration applied")
-                .await;
-        }
+        None
     }
 
     /// Get type contexts with caching
@@ -242,9 +98,6 @@ impl LanguageServer for Backend {
         };
 
         if let Some(root) = root {
-            self.initialize_config(params.initialization_options.as_ref(), &root)
-                .await;
-
             self.client
                 .log_message(
                     MessageType::INFO,
@@ -297,10 +150,6 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "RON LSP server initialized!")
             .await;
-
-        self.register_config_file_watching()
-            .await
-            .expect("failed to register config file watching");
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -348,28 +197,6 @@ impl LanguageServer for Backend {
             // Publish diagnostics
             self.publish_diagnostics(&uri, &content, type_annotation.as_deref())
                 .await;
-        }
-    }
-
-    async fn did_change_watched_files(
-        &self,
-        DidChangeWatchedFilesParams { changes, .. }: DidChangeWatchedFilesParams,
-    ) {
-        for FileEvent { uri, .. } in changes.iter() {
-            let Some(file_name) = uri
-                .to_file_path()
-                .ok()
-                .and_then(|path| path.file_name().map(ToOwned::to_owned))
-            else {
-                continue;
-            };
-
-            if file_name == Path::new(CONFIG_FILE_NAME).file_name().unwrap() {
-                self.config_file_changed().await;
-                return;
-            }
-
-            self.client.log_message(MessageType::WARNING, format!("Got a workspace/didChangeWatchedFiles notification for {}, but it is not implemented", file_name.display())).await;
         }
     }
 
