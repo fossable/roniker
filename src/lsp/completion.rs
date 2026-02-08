@@ -42,13 +42,12 @@ fn get_completion_context(content: &str, position: Position) -> CompletionContex
                     && position.character > name_end.column as u32)
             {
                 // Check if there's already some text (might be completing a type)
-                if let Some(val_text) = ts_utils::node_text(&value_node, content) {
-                    if val_text
+                if let Some(val_text) = ts_utils::node_text(&value_node, content)
+                    && val_text
                         .chars()
                         .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
-                    {
-                        return CompletionContext::StructType;
-                    }
+                {
+                    return CompletionContext::StructType;
                 }
 
                 return CompletionContext::FieldValue;
@@ -141,7 +140,7 @@ fn get_all_workspace_types(analyzer: Arc<RustAnalyzer>) -> Vec<CompletionItem> {
     analyzer
         .get_all_types()
         .into_iter()
-        .map(|type_info| create_type_completion(type_info))
+        .map(create_type_completion)
         .collect()
 }
 
@@ -190,44 +189,43 @@ fn generate_field_completions(
             // Check if we're inside a specific variant's fields
             if let Some(variant_name) =
                 tree_sitter_parser::find_current_variant_context(content, position)
+                && let Some(variant) = variants.iter().find(|v| v.name == variant_name)
             {
-                if let Some(variant) = variants.iter().find(|v| v.name == variant_name) {
-                    // Complete the variant's fields
-                    let used_fields = tree_sitter_parser::extract_fields_from_ron(content);
-                    return variant
-                        .fields
-                        .iter()
-                        .filter(|field| !used_fields.contains(&field.name))
-                        .map(|field| {
-                            let documentation = if let Some(docs) = &field.docs {
-                                Some(Documentation::MarkupContent(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value: format!(
-                                        "```rust\n{}: {}\n```\n\n{}",
-                                        field.name, field.type_name, docs
-                                    ),
-                                }))
-                            } else {
-                                Some(Documentation::MarkupContent(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value: format!(
-                                        "```rust\n{}: {}\n```",
-                                        field.name, field.type_name
-                                    ),
-                                }))
-                            };
+                // Complete the variant's fields
+                let used_fields = tree_sitter_parser::extract_fields_from_ron(content);
+                return variant
+                    .fields
+                    .iter()
+                    .filter(|field| !used_fields.contains(&field.name))
+                    .map(|field| {
+                        let documentation = if let Some(docs) = &field.docs {
+                            Some(Documentation::MarkupContent(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: format!(
+                                    "```rust\n{}: {}\n```\n\n{}",
+                                    field.name, field.type_name, docs
+                                ),
+                            }))
+                        } else {
+                            Some(Documentation::MarkupContent(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: format!(
+                                    "```rust\n{}: {}\n```",
+                                    field.name, field.type_name
+                                ),
+                            }))
+                        };
 
-                            CompletionItem {
-                                label: field.name.clone(),
-                                kind: Some(CompletionItemKind::FIELD),
-                                detail: Some(field.type_name.clone()),
-                                documentation,
-                                insert_text: Some(format!("{}: ", field.name)),
-                                ..Default::default()
-                            }
-                        })
-                        .collect();
-                }
+                        CompletionItem {
+                            label: field.name.clone(),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: Some(field.type_name.clone()),
+                            documentation,
+                            insert_text: Some(format!("{}: ", field.name)),
+                            ..Default::default()
+                        }
+                    })
+                    .collect();
             }
 
             // Otherwise, complete variant names
@@ -287,10 +285,10 @@ fn generate_value_completions_for_field(
     analyzer: Arc<RustAnalyzer>,
 ) -> Vec<CompletionItem> {
     // Find the field in the type info
-    if let TypeKind::Struct(fields) = &type_info.kind {
-        if let Some(field) = fields.iter().find(|f| f.name == field_name) {
-            return generate_value_completions_by_type(&field.type_name, analyzer);
-        }
+    if let TypeKind::Struct(fields) = &type_info.kind
+        && let Some(field) = fields.iter().find(|f| f.name == field_name)
+    {
+        return generate_value_completions_by_type(&field.type_name, analyzer);
     }
 
     Vec::new()
@@ -303,15 +301,15 @@ fn generate_type_completions_for_field(
     analyzer: Arc<RustAnalyzer>,
 ) -> Vec<CompletionItem> {
     // Find the field in the type info
-    if let TypeKind::Struct(fields) = &type_info.kind {
-        if let Some(field) = fields.iter().find(|f| f.name == field_name) {
-            // Get the inner type if it's a generic
-            let inner_type = extract_inner_type(&field.type_name);
+    if let TypeKind::Struct(fields) = &type_info.kind
+        && let Some(field) = fields.iter().find(|f| f.name == field_name)
+    {
+        // Get the inner type if it's a generic
+        let inner_type = extract_inner_type(&field.type_name);
 
-            // Try to get type info for this type
-            if let Some(nested_type) = analyzer.get_type_info(&inner_type) {
-                return vec![create_type_completion(nested_type)];
-            }
+        // Try to get type info for this type
+        if let Some(nested_type) = analyzer.get_type_info(&inner_type) {
+            return vec![create_type_completion(nested_type)];
         }
     }
 
@@ -376,10 +374,10 @@ fn create_type_completion(type_info: &TypeInfo) -> CompletionItem {
 fn extract_inner_type(type_string: &str) -> String {
     let clean = type_string.replace(" ", "");
 
-    if let Some(start) = clean.find('<') {
-        if let Some(end) = clean.rfind('>') {
-            return clean[start + 1..end].to_string();
-        }
+    if let Some(start) = clean.find('<')
+        && let Some(end) = clean.rfind('>')
+    {
+        return clean[start + 1..end].to_string();
     }
 
     type_string.to_string()
@@ -601,7 +599,7 @@ mod tests {
         let content = "MyEnum::StructVariant(\n    \n)";
         let position = Position::new(1, 4); // Inside the parens
 
-        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
+        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new(""));
         let completions =
             generate_completions_for_type(content, position, &type_info, analyzer);
 
@@ -659,7 +657,7 @@ mod tests {
         let content = "";
         let position = Position::new(0, 0);
 
-        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
+        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new(""));
         let completions =
             generate_completions_for_type(content, position, &type_info, analyzer);
 

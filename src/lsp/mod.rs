@@ -51,11 +51,10 @@ impl Backend {
         // Try to get from cache first
         {
             let documents = self.documents.read().await;
-            if let Some(doc) = documents.get(uri) {
-                if let Some(cached) = doc.context_cache.get(&pos_key) {
+            if let Some(doc) = documents.get(uri)
+                && let Some(cached) = doc.context_cache.get(&pos_key) {
                     return cached.clone();
                 }
-            }
         }
 
         // Not in cache, compute it
@@ -77,8 +76,8 @@ impl Backend {
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         // Log workspace info (types are now added via add_file/add_source methods)
-        if let Some(workspace_folders) = &params.workspace_folders {
-            if let Some(folder) = workspace_folders.first() {
+        if let Some(workspace_folders) = &params.workspace_folders
+            && let Some(folder) = workspace_folders.first() {
                 self.client
                     .log_message(
                         MessageType::INFO,
@@ -86,7 +85,6 @@ impl LanguageServer for Backend {
                     )
                     .await;
             }
-        }
 
         // Log registered types
         let types = self.rust_analyzer.get_all_types();
@@ -201,7 +199,7 @@ impl LanguageServer for Backend {
         };
 
         // Get root type from rust_analyzer
-        let type_path = self.rust_analyzer.get_root_type();
+        let type_path = &self.rust_analyzer.root_type;
 
         // Get the word at cursor position - early return if none
         let word = match get_word_at_position(&content, position) {
@@ -218,35 +216,27 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, format!("Word at position: {}", word))
             .await;
 
-        // If we have a type annotation, find the nested context
-        let current_type_info = if let Some(type_path) = type_path {
-            self.client
-                .log_message(MessageType::INFO, format!("Type annotation: {}", type_path))
-                .await;
-            // Use cached context lookup
-            let contexts = self.get_type_contexts(&uri, position, &content).await;
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!("Found {} type contexts", contexts.len()),
-                )
-                .await;
+        // Find the nested context
+        self.client
+            .log_message(MessageType::INFO, format!("Type annotation: {}", type_path))
+            .await;
+        // Use cached context lookup
+        let contexts = self.get_type_contexts(&uri, position, &content).await;
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("Found {} type contexts", contexts.len()),
+            )
+            .await;
 
-            // Use shared navigation helper
-            let info = self.navigate_to_innermost_type(&type_path, &contexts).await;
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!("Final type info: {:?}", info.as_ref().map(|i| &i.name)),
-                )
-                .await;
-            info
-        } else {
-            self.client
-                .log_message(MessageType::INFO, "No type annotation found")
-                .await;
-            None
-        };
+        // Use shared navigation helper
+        let current_type_info = self.navigate_to_innermost_type(type_path, &contexts).await;
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("Final type info: {:?}", current_type_info.as_ref().map(|i| &i.name)),
+            )
+            .await;
 
         if current_type_info.is_none() {
             self.client
@@ -422,8 +412,7 @@ impl LanguageServer for Backend {
             // Check if we're on a field, and if the word is a variant of that field's type
             // e.g., in "post_type: Short", if cursor is near Short, check if it's a variant of PostType
             if let Some(field_name) = tree_sitter_parser::get_field_at_position(&content, position)
-            {
-                if let Some(field) = info.find_field(&field_name) {
+                && let Some(field) = info.find_field(&field_name) {
                     // Get the type of this specific field
                     if let Some(field_type_info) =
                         self.rust_analyzer.get_type_info(&field.type_name).cloned()
@@ -438,7 +427,6 @@ impl LanguageServer for Backend {
                         }
                     }
                 }
-            }
         }
 
         // If no type annotation, or word doesn't match a field, try to find as a type
@@ -467,7 +455,7 @@ impl LanguageServer for Backend {
         };
 
         // Get root type from rust_analyzer
-        let type_path = self.rust_analyzer.get_root_type();
+        let type_path = &self.rust_analyzer.root_type;
 
         // Get the word at cursor position
         let word = match get_word_at_position(&content, position) {
@@ -475,26 +463,24 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        if let Some(type_path) = type_path {
+        {
             // Use cached context lookup
             let contexts = self.get_type_contexts(&uri, position, &content).await;
 
             // Use shared navigation helper
-            let current_type_info = self.navigate_to_innermost_type(&type_path, &contexts).await;
+            let current_type_info = self.navigate_to_innermost_type(type_path, &contexts).await;
 
             // Now check what the word at cursor is
             if let Some(type_info) = current_type_info {
                 // Case 1: Hovering over a field name
                 if let Some(field_name) =
                     tree_sitter_parser::get_field_at_position(&content, position)
-                {
-                    if field_name == word {
+                    && field_name == word {
                         // First check if we're in an enum variant's fields
                         if let Some(variant_name) =
                             tree_sitter_parser::find_current_variant_context(&content, position)
-                        {
-                            if let Some(variant) = type_info.find_variant(&variant_name) {
-                                if let Some(field) =
+                            && let Some(variant) = type_info.find_variant(&variant_name)
+                                && let Some(field) =
                                     variant.fields.iter().find(|f| f.name == field_name)
                                 {
                                     return Ok(Some(Hover {
@@ -510,12 +496,10 @@ impl LanguageServer for Backend {
                                         range: None,
                                     }));
                                 }
-                            }
-                        }
 
                         // Otherwise check struct fields
-                        if let Some(fields) = type_info.fields() {
-                            if let Some(field) = fields.iter().find(|f| f.name == field_name) {
+                        if let Some(fields) = type_info.fields()
+                            && let Some(field) = fields.iter().find(|f| f.name == field_name) {
                                 return Ok(Some(Hover {
                                     contents: HoverContents::Markup(MarkupContent {
                                         kind: MarkupKind::Markdown,
@@ -529,9 +513,7 @@ impl LanguageServer for Backend {
                                     range: None,
                                 }));
                             }
-                        }
                     }
-                }
 
                 // Case 2: Hovering over a variant name
                 if let Some(variant) = type_info.find_variant(&word) {
@@ -580,8 +562,7 @@ impl LanguageServer for Backend {
                 // Case 4: Check if hovering over a field value that's a variant (like "Short" in "post_type: Short")
                 if let Some(field_name) =
                     tree_sitter_parser::get_field_at_position(&content, position)
-                {
-                    if let Some(field) = type_info.find_field(&field_name) {
+                    && let Some(field) = type_info.find_field(&field_name) {
                         // Get the type of this field
                         if let Some(field_type_info) =
                             self.rust_analyzer.get_type_info(&field.type_name).cloned()
@@ -626,7 +607,6 @@ impl LanguageServer for Backend {
                             }
                         }
                     }
-                }
             }
         }
 
@@ -658,24 +638,22 @@ impl LanguageServer for Backend {
         };
 
         // Get root type from rust_analyzer
-        let type_path = self.rust_analyzer.get_root_type();
+        let type_path = &self.rust_analyzer.root_type;
 
-        if let Some(type_path) = type_path {
-            // Get type contexts
-            let contexts = self.get_type_contexts(&uri, position, &content).await;
+        // Get type contexts
+        let contexts = self.get_type_contexts(&uri, position, &content).await;
 
-            // Navigate to innermost type using shared helper
-            let current_type_info = self.navigate_to_innermost_type(&type_path, &contexts).await;
+        // Navigate to innermost type using shared helper
+        let current_type_info = self.navigate_to_innermost_type(type_path, &contexts).await;
 
-            if let Some(type_info) = current_type_info {
-                let completions = completion::generate_completions_for_type(
-                    &content,
-                    position,
-                    &type_info,
-                    self.rust_analyzer.clone(),
-                );
-                return Ok(Some(CompletionResponse::Array(completions)));
-            }
+        if let Some(type_info) = current_type_info {
+            let completions = completion::generate_completions_for_type(
+                &content,
+                position,
+                &type_info,
+                self.rust_analyzer.clone(),
+            );
+            return Ok(Some(CompletionResponse::Array(completions)));
         }
 
         Ok(None)
@@ -706,45 +684,39 @@ impl LanguageServer for Backend {
         };
 
         // Get root type from rust_analyzer
-        let type_path = self.rust_analyzer.get_root_type();
+        let type_path = &self.rust_analyzer.root_type;
 
-        if let Some(type_path) = type_path {
+        self.client
+            .log_message(MessageType::INFO, format!("Root type: {}", type_path))
+            .await;
+        if let Some(type_info) = self.rust_analyzer.get_type_info(type_path).cloned() {
             self.client
-                .log_message(MessageType::INFO, format!("Root type: {}", type_path))
-                .await;
-            if let Some(type_info) = self.rust_analyzer.get_type_info(&type_path).cloned() {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("Type info kind: {:?}", type_info.kind),
-                    )
-                    .await;
-                let actions = code_actions::generate_code_actions(
-                    &content,
-                    &type_info,
-                    &uri,
-                    self.rust_analyzer.clone(),
-                    &self.client,
+                .log_message(
+                    MessageType::INFO,
+                    format!("Type info kind: {:?}", type_info.kind),
                 )
                 .await;
+            let actions = code_actions::generate_code_actions(
+                &content,
+                &type_info,
+                &uri,
+                self.rust_analyzer.clone(),
+                &self.client,
+            )
+            .await;
 
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("Generated {} code actions", actions.len()),
-                    )
-                    .await;
-                if !actions.is_empty() {
-                    return Ok(Some(actions));
-                }
-            } else {
-                self.client
-                    .log_message(MessageType::INFO, "Could not get type info")
-                    .await;
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("Generated {} code actions", actions.len()),
+                )
+                .await;
+            if !actions.is_empty() {
+                return Ok(Some(actions));
             }
         } else {
             self.client
-                .log_message(MessageType::INFO, "No type annotation")
+                .log_message(MessageType::INFO, "Could not get type info")
                 .await;
         }
 
@@ -833,8 +805,8 @@ impl LanguageServer for Backend {
         let new_name = params.new_name;
 
         let documents = self.documents.read().await;
-        if let Some(doc) = documents.get(&uri) {
-            if let Some(field_name) =
+        if let Some(doc) = documents.get(&uri)
+            && let Some(field_name) =
                 tree_sitter_parser::get_field_at_position(&doc.content, position)
             {
                 // Find all occurrences of this field name in the document
@@ -869,7 +841,6 @@ impl LanguageServer for Backend {
                     }));
                 }
             }
-        }
 
         Ok(None)
     }
@@ -1013,8 +984,8 @@ impl Backend {
                 }
 
                 // If not found as a variant of the current type, try to find it in field types
-                if !found_via_variant {
-                    if let Some(fields) = info.fields() {
+                if !found_via_variant
+                    && let Some(fields) = info.fields() {
                         for field in fields {
                             if let Some(field_type_info) =
                                 self.rust_analyzer.get_type_info(&field.type_name).cloned()
@@ -1028,7 +999,6 @@ impl Backend {
                             }
                         }
                     }
-                }
 
                 if !found_via_variant {
                     current_type_info = None;
@@ -1099,58 +1069,51 @@ impl Backend {
 
     async fn publish_diagnostics(&self, uri: &str, content: &str) {
         // Get root type from rust_analyzer
-        let type_path = self.rust_analyzer.get_root_type();
+        let type_path = &self.rust_analyzer.root_type;
 
         self.client
             .log_message(
                 MessageType::INFO,
                 format!(
-                    "Publishing diagnostics for {} with root type: {:?}",
+                    "Publishing diagnostics for {} with root type: {}",
                     uri, type_path
                 ),
             )
             .await;
 
-        let diagnostics = if let Some(type_path) = type_path {
-            if let Some(type_info) = self.rust_analyzer.get_type_info(&type_path).cloned() {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("Found type info for {}: {:?}", type_path, type_info.name),
-                    )
-                    .await;
-                let diags = diagnostics::validate_ron_with_analyzer(
-                    content,
-                    &type_info,
-                    self.rust_analyzer.clone(),
+        let diagnostics = if let Some(type_info) = self.rust_analyzer.get_type_info(type_path).cloned() {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("Found type info for {}: {:?}", type_path, type_info.name),
                 )
                 .await;
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("Generated {} diagnostics", diags.len()),
-                    )
-                    .await;
-                diags
-            } else {
-                self.client
-                    .log_message(
-                        MessageType::WARNING,
-                        format!("Could not find type: {}", type_path),
-                    )
-                    .await;
-                vec![Diagnostic {
-                    range: Range::new(Position::new(0, 0), Position::new(0, 1)),
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    message: format!("Could not find type: {}", type_path),
-                    ..Default::default()
-                }]
-            }
+            let diags = diagnostics::validate_ron_with_analyzer(
+                content,
+                &type_info,
+                self.rust_analyzer.clone(),
+            )
+            .await;
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("Generated {} diagnostics", diags.len()),
+                )
+                .await;
+            diags
         } else {
             self.client
-                .log_message(MessageType::INFO, "No root type set")
+                .log_message(
+                    MessageType::WARNING,
+                    format!("Could not find type: {}", type_path),
+                )
                 .await;
-            vec![]
+            vec![Diagnostic {
+                range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: format!("Could not find type: {}", type_path),
+                ..Default::default()
+            }]
         };
 
         self.client
@@ -1190,7 +1153,7 @@ mod tests {
     #[tokio::test]
     async fn test_lsp_hover_on_struct_field() {
         // Set up analyzer with a type with documented fields
-        let mut analyzer = RustAnalyzer::new();
+        let mut analyzer = RustAnalyzer::new("crate::User");
         analyzer.add_type(TypeInfo {
             name: "crate::User".to_string(),
             kind: TypeKind::Struct(vec![
@@ -1225,7 +1188,6 @@ mod tests {
             column: Some(0),
             has_default: false,
         });
-        analyzer.set_root_type("crate::User");
 
         let backend = create_test_backend_with_analyzer(analyzer).await;
 
@@ -1316,7 +1278,7 @@ mod tests {
     #[tokio::test]
     async fn test_lsp_hover_on_enum_variant() {
         // Set up an enum type
-        let mut analyzer = RustAnalyzer::new();
+        let mut analyzer = RustAnalyzer::new("crate::Status");
         analyzer.add_type(TypeInfo {
             name: "crate::Status".to_string(),
             kind: TypeKind::Enum(vec![
@@ -1348,7 +1310,6 @@ mod tests {
             column: Some(0),
             has_default: false,
         });
-        analyzer.set_root_type("crate::Status");
 
         let backend = create_test_backend_with_analyzer(analyzer).await;
 
@@ -1419,9 +1380,8 @@ mod tests {
             has_default: false,
         };
 
-        let mut analyzer = RustAnalyzer::new();
+        let mut analyzer = RustAnalyzer::new("crate::Config");
         analyzer.add_type(config_type);
-        analyzer.set_root_type("crate::Config");
         let backend = create_test_backend_with_analyzer(analyzer).await;
 
         let uri: Url = "file:///test/config.ron".parse().unwrap();
@@ -1487,9 +1447,8 @@ mod tests {
             has_default: false,
         };
 
-        let mut analyzer = RustAnalyzer::new();
+        let mut analyzer = RustAnalyzer::new("crate::Simple");
         analyzer.add_type(simple_type);
-        analyzer.set_root_type("crate::Simple");
         let backend = create_test_backend_with_analyzer(analyzer).await;
 
         let uri: Url = "file:///test/simple.ron".parse().unwrap();
@@ -1551,9 +1510,8 @@ mod tests {
             has_default: false,
         };
 
-        let mut analyzer = RustAnalyzer::new();
+        let mut analyzer = RustAnalyzer::new("crate::User");
         analyzer.add_type(user_type);
-        analyzer.set_root_type("crate::User");
         let backend = create_test_backend_with_analyzer(analyzer).await;
 
         let uri: Url = "file:///test/user.ron".parse().unwrap();

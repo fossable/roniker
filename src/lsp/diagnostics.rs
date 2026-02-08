@@ -154,28 +154,24 @@ async fn validate_enum_variant_fields_in_structs(
                 current_type_info = direct_lookup;
             } else {
                 let mut found_via_variant = false;
-                if let Some(variant) = info.find_variant(&context.type_name) {
-                    if variant.fields.len() == 1 {
+                if let Some(variant) = info.find_variant(&context.type_name)
+                    && variant.fields.len() == 1 {
                         let field_type = &variant.fields[0].type_name;
                         current_type_info = analyzer.get_type_info(field_type).cloned();
                         found_via_variant = true;
                     }
-                }
-                if !found_via_variant {
-                    if let Some(fields) = info.fields() {
+                if !found_via_variant
+                    && let Some(fields) = info.fields() {
                         for field in fields {
                             if let Some(field_type_info) =
                                 analyzer.get_type_info(&field.type_name).cloned()
-                            {
-                                if field_type_info.find_variant(&context.type_name).is_some() {
+                                && field_type_info.find_variant(&context.type_name).is_some() {
                                     current_type_info = Some(field_type_info);
                                     found_via_variant = true;
                                     break;
                                 }
-                            }
                         }
                     }
-                }
                 if !found_via_variant {
                     current_type_info = None;
                 }
@@ -212,8 +208,8 @@ async fn validate_enum_variant_fields_in_structs(
                     location.containing_field_name.clone(),
                     location.variant_name.clone(),
                 );
-                if let Some(Some(variant)) = variant_cache.get(&cache_key) {
-                    if !variant.fields.iter().any(|f| f.name == *field_at_pos) {
+                if let Some(Some(variant)) = variant_cache.get(&cache_key)
+                    && !variant.fields.iter().any(|f| f.name == *field_at_pos) {
                         let line = lines.get(location.line_idx).unwrap_or(&"");
                         if let Some(col) = line
                             .find(&format!("{}:", field_at_pos))
@@ -237,7 +233,6 @@ async fn validate_enum_variant_fields_in_structs(
                             reported_errors.insert(error_key);
                         }
                     }
-                }
             }
         }
     }
@@ -258,13 +253,12 @@ async fn validate_enum_variant_fields_in_structs(
                     let mut variant_line_idx = first_line;
                     let mut variant_col = 0;
                     for i in (0..=first_line).rev() {
-                        if let Some(line) = lines.get(i) {
-                            if let Some(col) = line.find(&variant_name) {
+                        if let Some(line) = lines.get(i)
+                            && let Some(col) = line.find(&variant_name) {
                                 variant_line_idx = i;
                                 variant_col = col;
                                 break;
                             }
-                        }
                     }
 
                     diagnostics.push(Diagnostic {
@@ -318,13 +312,13 @@ async fn validate_struct_fields(
     // Check for unknown fields in RON using tree-sitter for position
     use super::ts_utils::{self, RonParser};
     let mut parser = RonParser::new();
-    if let Some(tree) = parser.parse(content) {
-        if let Some(main_value) = ts_utils::find_main_value(&tree) {
-            if main_value.kind() == "struct" {
+    if let Some(tree) = parser.parse(content)
+        && let Some(main_value) = ts_utils::find_main_value(&tree)
+            && main_value.kind() == "struct" {
                 let field_nodes = ts_utils::struct_fields(&main_value);
                 for field_node in field_nodes {
-                    if let Some(field_name) = ts_utils::field_name(&field_node, content) {
-                        if !fields.iter().any(|f| f.name == field_name) {
+                    if let Some(field_name) = ts_utils::field_name(&field_node, content)
+                        && !fields.iter().any(|f| f.name == field_name) {
                             let range = ts_utils::node_to_lsp_range(&field_node.child(0).unwrap());
                             diagnostics.push(Diagnostic {
                                 range,
@@ -333,11 +327,8 @@ async fn validate_struct_fields(
                                 ..Default::default()
                             });
                         }
-                    }
                 }
             }
-        }
-    }
 
     // Type check each field if we successfully parsed the RON
     if let Ok(value) = parsed_value {
@@ -361,16 +352,15 @@ async fn validate_struct_fields(
             for field in fields {
                 if let Some(field_value) = map.get(&Value::String(field.name.clone())) {
                     // For custom types (structs/enums), recursively validate
-                    if let Some(analyzer) = analyzer {
-                        if !is_primitive_type(&field.type_name)
+                    if let Some(analyzer) = analyzer
+                        && !is_primitive_type(&field.type_name)
                             && !is_std_generic_type(&field.type_name)
-                        {
-                            if let Some(nested_type_info) =
+                            && let Some(nested_type_info) =
                                 analyzer.get_type_info(&field.type_name).cloned()
                             {
                                 // Use pre-extracted position and content
-                                if let Some(&(line_num, _, _)) = field_positions.get(&field.name) {
-                                    if let Some(field_content) = field_contents.get(&field.name) {
+                                if let Some(&(line_num, _, _)) = field_positions.get(&field.name)
+                                    && let Some(field_content) = field_contents.get(&field.name) {
                                         let mut nested_diags =
                                             Box::pin(validate_ron_with_analyzer(
                                                 field_content,
@@ -386,10 +376,7 @@ async fn validate_struct_fields(
                                         diagnostics.extend(nested_diags);
                                         continue; // Skip type checking since we did full validation
                                     }
-                                }
                             }
-                        }
-                    }
 
                     // Check type - with enum validation if analyzer is available
                     let type_mismatch = if let Some(analyzer) = analyzer {
@@ -554,11 +541,9 @@ async fn validate_node_with_type_info<'a>(
                                 {
                                     if !is_primitive_type(&inner_type)
                                         && !is_std_generic_type(&inner_type)
-                                    {
-                                        if let Some(inner_type_info) =
+                                        && let Some(inner_type_info) =
                                             analyzer.get_type_info(&inner_type).cloned()
-                                        {
-                                            if value_node.kind() == "array" {
+                                            && value_node.kind() == "array" {
                                                 let mut cursor = value_node.walk();
                                                 for elem_node in value_node.children(&mut cursor) {
                                                     if elem_node.kind() != "["
@@ -577,8 +562,6 @@ async fn validate_node_with_type_info<'a>(
                                                     }
                                                 }
                                             }
-                                        }
-                                    }
                                 } else if !is_primitive_type(&field_type_normalized)
                                     && !is_std_generic_type(&field_type_normalized)
                                 {
@@ -614,7 +597,7 @@ async fn validate_node_with_type_info<'a>(
                 if !type_info.has_default {
                     for field in fields {
                         if !present_fields.contains(&field.name) && !field.is_optional() {
-                            let target_node = node.child(0).unwrap_or_else(|| *node);
+                            let target_node = node.child(0).unwrap_or(*node);
                             let range = ts_utils::node_to_lsp_range(&target_node);
                             diagnostics.push(Diagnostic {
                                 range,
@@ -661,15 +644,15 @@ async fn validate_variant_field_data(
 
         // Check if it's Vec<CustomType>
         if let Some(inner_type) = extract_inner_type(&normalized_type, "Vec<") {
-            if !is_primitive_type(&inner_type) && !is_std_generic_type(&inner_type) {
-                if let Some(nested_type_info) = analyzer.get_type_info(&inner_type).cloned() {
+            if !is_primitive_type(&inner_type) && !is_std_generic_type(&inner_type)
+                && let Some(nested_type_info) = analyzer.get_type_info(&inner_type).cloned() {
                     // Parse with tree-sitter
                     use super::ts_utils::{self, RonParser};
                     let mut parser = RonParser::new();
 
-                    if let Some(tree) = parser.parse(data) {
-                        if let Some(array_node) = ts_utils::find_main_value(&tree) {
-                            if array_node.kind() == "array" {
+                    if let Some(tree) = parser.parse(data)
+                        && let Some(array_node) = ts_utils::find_main_value(&tree)
+                            && array_node.kind() == "array" {
                                 let mut cursor = array_node.walk();
                                 for elem_node in array_node.children(&mut cursor) {
                                     if elem_node.kind() != "["
@@ -687,11 +670,8 @@ async fn validate_variant_field_data(
                                     }
                                 }
                             }
-                        }
-                    }
                     return diagnostics;
                 }
-            }
         } else if !is_primitive_type(field_type) {
             // Non-generic custom type - recursively validate
             if let Some(nested_type_info) = analyzer.get_type_info(field_type).cloned() {
@@ -745,8 +725,8 @@ async fn validate_variant_field_data(
 
                     // Validate field types
                     for field in expected_fields {
-                        if let Some(field_value) = map.get(&Value::String(field.name.clone())) {
-                            if let Some(error_msg) = check_type_mismatch_with_enum_validation(
+                        if let Some(field_value) = map.get(&Value::String(field.name.clone()))
+                            && let Some(error_msg) = check_type_mismatch_with_enum_validation(
                                 field_value,
                                 &field.type_name,
                                 data,
@@ -765,7 +745,6 @@ async fn validate_variant_field_data(
                                     ..Default::default()
                                 });
                             }
-                        }
                     }
                 }
             } else {
@@ -773,8 +752,8 @@ async fn validate_variant_field_data(
                 // For tuple variants, fields are named "0", "1", "2", etc.
                 if let Value::Seq(values) = value {
                     for (i, field) in expected_fields.iter().enumerate() {
-                        if let Some(field_value) = values.get(i) {
-                            if let Some(error_msg) = check_type_mismatch_with_enum_validation(
+                        if let Some(field_value) = values.get(i)
+                            && let Some(error_msg) = check_type_mismatch_with_enum_validation(
                                 field_value,
                                 &field.type_name,
                                 data,
@@ -793,7 +772,6 @@ async fn validate_variant_field_data(
                                     ..Default::default()
                                 });
                             }
-                        }
                     }
                 } else if expected_fields.len() == 1 {
                     // Single field tuple variant
@@ -906,12 +884,11 @@ fn find_variant_position(content: &str, variant: &str) -> (u32, u32) {
     if let Some(tree) = parser.parse(content) {
         let variants = ts_utils::find_potential_variants(&tree, content);
         for v in variants {
-            if let Some(text) = ts_utils::node_text(&v, content) {
-                if text == variant {
+            if let Some(text) = ts_utils::node_text(&v, content)
+                && text == variant {
                     let pos = v.start_position();
                     return (pos.row as u32, pos.column as u32);
                 }
-            }
         }
     }
 
@@ -924,22 +901,19 @@ fn find_struct_name_position(content: &str) -> (u32, u32, u32) {
     use super::ts_utils::{self, RonParser};
 
     let mut parser = RonParser::new();
-    if let Some(tree) = parser.parse(content) {
-        if let Some(main_value) = ts_utils::find_main_value(&tree) {
-            if main_value.kind() == "struct" {
-                if let Some(name_node) = main_value.child(0) {
-                    if name_node.kind() == "identifier" {
+    if let Some(tree) = parser.parse(content)
+        && let Some(main_value) = ts_utils::find_main_value(&tree)
+            && main_value.kind() == "struct" {
+                if let Some(name_node) = main_value.child(0)
+                    && name_node.kind() == "identifier" {
                         let pos = name_node.start_position();
                         let end_pos = name_node.end_position();
                         return (pos.row as u32, pos.column as u32, end_pos.column as u32);
                     }
-                }
                 // Unnamed struct
                 let pos = main_value.start_position();
                 return (pos.row as u32, pos.column as u32, pos.column as u32);
             }
-        }
-    }
 
     (0, 0, 1)
 }
@@ -951,22 +925,19 @@ fn find_field_value_position(content: &str, field_name: &str) -> Option<(usize, 
     let mut parser = RonParser::new();
     let tree = parser.parse(content)?;
 
-    if let Some(main_value) = ts_utils::find_main_value(&tree) {
-        if main_value.kind() == "struct" {
+    if let Some(main_value) = ts_utils::find_main_value(&tree)
+        && main_value.kind() == "struct" {
             let fields = ts_utils::struct_fields(&main_value);
             for field in fields {
-                if let Some(name) = ts_utils::field_name(&field, content) {
-                    if name == field_name {
-                        if let Some(value_node) = ts_utils::field_value(&field) {
+                if let Some(name) = ts_utils::field_name(&field, content)
+                    && name == field_name
+                        && let Some(value_node) = ts_utils::field_value(&field) {
                             let pos = value_node.start_position();
                             let end_pos = value_node.end_position();
                             return Some((pos.row, pos.column, end_pos.column));
                         }
-                    }
-                }
             }
         }
-    }
 
     None
 }
@@ -986,13 +957,13 @@ async fn check_type_mismatch_with_enum_validation(
     }
 
     // If the expected type is custom (not primitive), check if it's an enum and validate the variant
-    if !is_primitive_type(expected_type) {
-        if let Some(field_value_text) = extract_field_value_text(content, field_name) {
+    if !is_primitive_type(expected_type)
+        && let Some(field_value_text) = extract_field_value_text(content, field_name) {
             let trimmed = field_value_text.trim();
 
             // Check if the type is an enum
-            if let Some(type_info) = analyzer.get_type_info(expected_type).cloned() {
-                if let TypeKind::Enum(variants) = &type_info.kind {
+            if let Some(type_info) = analyzer.get_type_info(expected_type).cloned()
+                && let TypeKind::Enum(variants) = &type_info.kind {
                     // Extract the variant name from the text
                     let variant_name = trimmed.split('(').next().unwrap_or(trimmed).trim();
 
@@ -1004,9 +975,7 @@ async fn check_type_mismatch_with_enum_validation(
                         ));
                     }
                 }
-            }
         }
-    }
 
     None
 }
@@ -1088,23 +1057,18 @@ fn extract_field_value_text(content: &str, field_name: &str) -> Option<String> {
             let root = tree.root_node();
             let mut cursor = root.walk();
             let result = root.children(&mut cursor).find(|n| n.kind() == "struct");
-            match result {
-                Some(s) => s,
-                None => return None,
-            }
+            result?
         } else {
             main_value
         };
 
         let field_nodes = ts_utils::struct_fields(&struct_node);
         for field_node in field_nodes {
-            if let Some(name) = ts_utils::field_name(&field_node, content) {
-                if name == field_name {
-                    if let Some(value_node) = ts_utils::field_value(&field_node) {
+            if let Some(name) = ts_utils::field_name(&field_node, content)
+                && name == field_name
+                    && let Some(value_node) = ts_utils::field_value(&field_node) {
                         return ts_utils::node_text(&value_node, content).map(|s| s.to_string());
                     }
-                }
-            }
         }
     }
 
@@ -1298,19 +1262,16 @@ fn parse_error_position(error_msg: &str, content: &str) -> (u32, u32) {
     // Try to find "line X column Y" pattern
     if let Some(line_start) = error_msg.find("line ") {
         let rest = &error_msg[line_start + 5..];
-        if let Some(line_end) = rest.find(|c: char| !c.is_numeric()) {
-            if let Ok(line) = rest[..line_end].parse::<u32>() {
-                if let Some(col_start) = rest.find("column ") {
+        if let Some(line_end) = rest.find(|c: char| !c.is_numeric())
+            && let Ok(line) = rest[..line_end].parse::<u32>()
+                && let Some(col_start) = rest.find("column ") {
                     let col_rest = &rest[col_start + 7..];
-                    if let Some(col_end) = col_rest.find(|c: char| !c.is_numeric()) {
-                        if let Ok(col) = col_rest[..col_end].parse::<u32>() {
+                    if let Some(col_end) = col_rest.find(|c: char| !c.is_numeric())
+                        && let Ok(col) = col_rest[..col_end].parse::<u32>() {
                             // RON reports 1-indexed, LSP expects 0-indexed
                             return (line.saturating_sub(1), col.saturating_sub(1));
                         }
-                    }
                 }
-            }
-        }
     }
 
     // Try to find "X:Y" pattern (common in parsers)
@@ -1321,11 +1282,10 @@ fn parse_error_position(error_msg: &str, content: &str) -> (u32, u32) {
             let line_str = &before[line_start + 1..];
             if let Ok(line) = line_str.parse::<u32>() {
                 let after = &error_msg[colon_pos + 1..];
-                if let Some(col_end) = after.find(|c: char| !c.is_numeric()) {
-                    if let Ok(col) = after[..col_end].parse::<u32>() {
+                if let Some(col_end) = after.find(|c: char| !c.is_numeric())
+                    && let Ok(col) = after[..col_end].parse::<u32>() {
                         return (line.saturating_sub(1), col.saturating_sub(1));
                     }
-                }
             }
         }
     }
@@ -1402,7 +1362,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_enum_variant_validation() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = Arc::new(RustAnalyzer::new(""));
         let type_info = TypeInfo {
             name: "PostType".to_string(),
             kind: TypeKind::Enum(vec![
@@ -1471,7 +1431,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_struct_with_enum_field() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = Arc::new(RustAnalyzer::new(""));
         let type_info = TypeInfo {
             name: "Post".to_string(),
             kind: TypeKind::Struct(vec![
@@ -1524,7 +1484,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_struct_field_expects_struct_not_primitive() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = Arc::new(RustAnalyzer::new(""));
         let type_info = TypeInfo {
             name: "Post".to_string(),
             kind: TypeKind::Struct(vec![
@@ -1586,7 +1546,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_type_mismatch_primitives() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = Arc::new(RustAnalyzer::new(""));
         let type_info = TypeInfo {
             name: "User".to_string(),
             kind: TypeKind::Struct(vec![
@@ -1655,7 +1615,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_enum_in_struct_field() {
         // This test ensures that invalid enum variants in struct fields are caught
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = Arc::new(RustAnalyzer::new(""));
         let type_info = TypeInfo {
             name: "Post".to_string(),
             kind: TypeKind::Struct(vec![
@@ -1698,7 +1658,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unnamed_struct_syntax() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = Arc::new(RustAnalyzer::new(""));
         let type_info = TypeInfo {
             name: "User".to_string(),
             kind: TypeKind::Struct(vec![
@@ -1742,7 +1702,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_enum_with_tuple_variant() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = Arc::new(RustAnalyzer::new(""));
         let type_info = TypeInfo {
             name: "Value".to_string(),
             kind: TypeKind::Enum(vec![
@@ -1805,7 +1765,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_enum_with_struct_variant() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = Arc::new(RustAnalyzer::new(""));
         let type_info = TypeInfo {
             name: "Message".to_string(),
             kind: TypeKind::Enum(vec![EnumVariant {
@@ -1897,7 +1857,7 @@ PostReference(Post(
 
     #[tokio::test]
     async fn test_unit_variant_with_data_error() {
-        let analyzer = Arc::new(RustAnalyzer::new());
+        let analyzer = Arc::new(RustAnalyzer::new(""));
         let type_info = TypeInfo {
             name: "Status".to_string(),
             kind: TypeKind::Enum(vec![
@@ -2000,7 +1960,7 @@ PostReference(Post(
         };
 
         // Register User type with the analyzer
-        let mut analyzer = RustAnalyzer::new();
+        let mut analyzer = RustAnalyzer::new("");
         analyzer.add_type(user_type);
         let analyzer = Arc::new(analyzer);
 

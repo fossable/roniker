@@ -103,17 +103,12 @@ fn format_struct(
     if !fields.is_empty() {
         output.push('\n');
 
-        for (i, field) in fields.iter().enumerate() {
+        for field in fields.iter() {
             output.push_str(&indent_str.repeat(indent_level + 1));
             format_field(field, content, output, indent_level + 1, indent_str);
 
-            // Add comma after each field
-            if i < fields.len() - 1 {
-                output.push(',');
-            } else {
-                // Optional trailing comma on last field
-                output.push(',');
-            }
+            // Add comma after each field (including trailing comma on last field)
+            output.push(',');
             output.push('\n');
         }
 
@@ -202,7 +197,7 @@ fn format_array(
     if !elements.is_empty() {
         output.push('\n');
 
-        for (i, element) in elements.iter().enumerate() {
+        for element in elements.iter() {
             output.push_str(&indent_str.repeat(indent_level + 1));
             format_node(
                 element,
@@ -213,11 +208,7 @@ fn format_array(
                 false,
             );
 
-            if i < elements.len() - 1 {
-                output.push(',');
-            } else {
-                output.push(',');
-            }
+            output.push(',');
             output.push('\n');
         }
 
@@ -251,7 +242,7 @@ fn format_map(
     if !entries.is_empty() {
         output.push('\n');
 
-        for (i, entry) in entries.iter().enumerate() {
+        for entry in entries.iter() {
             output.push_str(&indent_str.repeat(indent_level + 1));
 
             // Format map entry (key: value)
@@ -278,11 +269,7 @@ fn format_map(
                 );
             }
 
-            if i < entries.len() - 1 {
-                output.push(',');
-            } else {
-                output.push(',');
-            }
+            output.push(',');
             output.push('\n');
         }
 
@@ -308,7 +295,7 @@ fn format_tuple(
     if !elements.is_empty() {
         output.push('\n');
 
-        for (i, element) in elements.iter().enumerate() {
+        for element in elements.iter() {
             output.push_str(&indent_str.repeat(indent_level + 1));
             format_node(
                 element,
@@ -319,11 +306,7 @@ fn format_tuple(
                 false,
             );
 
-            if i < elements.len() - 1 {
-                output.push(',');
-            } else {
-                output.push(',');
-            }
+            output.push(',');
             output.push('\n');
         }
 

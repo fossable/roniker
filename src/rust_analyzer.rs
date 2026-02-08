@@ -1,9 +1,13 @@
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
 use std::path::PathBuf;
-use std::path::{Component, Path};
+#[cfg(feature = "analyze")]
+use std::{
+    fs,
+    path::{Component, Path},
+};
+#[cfg(feature = "analyze")]
+use anyhow::{Context, Result};
 #[cfg(feature = "analyze")]
 use syn::{Fields, Item, ItemEnum, ItemStruct, ItemType};
 
@@ -78,32 +82,30 @@ impl TypeInfo {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RustAnalyzer {
-    root_type: Option<String>,
+    pub root_type: String,
     type_cache: HashMap<String, TypeInfo>,
     type_aliases: HashMap<String, String>,
 }
 
 impl RustAnalyzer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the root type path for this analyzer (e.g., "crate::models::Config")
-    pub fn set_root_type(&mut self, type_path: &str) {
-        self.root_type = Some(type_path.to_string());
-    }
-
-    /// Get the root type path
-    pub fn get_root_type(&self) -> Option<&str> {
-        self.root_type.as_deref()
+    /// Create a new RustAnalyzer with the given root type path (e.g., "crate::models::Config")
+    pub fn new(root_type: impl Into<String>) -> Self {
+        Self {
+            root_type: root_type.into(),
+            type_cache: HashMap::new(),
+            type_aliases: HashMap::new(),
+        }
     }
 
     /// Get the TypeInfo for the root type
-    pub fn get_root_type_info(&self) -> Option<&TypeInfo> {
-        let root_type = self.get_root_type()?;
-        self.get_type_info(root_type)
+    ///
+    /// # Panics
+    /// Panics if the root type has not been registered with the analyzer.
+    pub fn root_type_info(&self) -> &TypeInfo {
+        self.get_type_info(&self.root_type)
+            .expect("root type not registered")
     }
 
     /// Register a type directly with the analyzer.
@@ -562,10 +564,10 @@ fn extract_docs(attrs: &[syn::Attribute]) -> Option<String> {
         .filter_map(|attr| {
             if attr.path().is_ident("doc") {
                 attr.meta.require_name_value().ok().and_then(|nv| {
-                    if let syn::Expr::Lit(lit) = &nv.value {
-                        if let syn::Lit::Str(s) = &lit.lit {
-                            return Some(s.value().trim().to_string());
-                        }
+                    if let syn::Expr::Lit(lit) = &nv.value
+                        && let syn::Lit::Str(s) = &lit.lit
+                    {
+                        return Some(s.value().trim().to_string());
                     }
                     None
                 })
@@ -653,8 +655,7 @@ mod tests {
 
     #[test]
     fn test_rust_analyzer_serialization_roundtrip() {
-        let mut analyzer = RustAnalyzer::new();
-        analyzer.set_root_type("crate::Test");
+        let mut analyzer = RustAnalyzer::new("crate::Test");
         analyzer.add_type(TypeInfo {
             name: "Test".to_string(),
             kind: TypeKind::Struct(vec![]),
@@ -669,12 +670,12 @@ mod tests {
         let deserialized: RustAnalyzer = serde_json::from_str(&json).unwrap();
 
         assert!(deserialized.get_type_info("Test").is_some());
-        assert_eq!(deserialized.get_root_type(), Some("crate::Test"));
+        assert_eq!(deserialized.root_type, "crate::Test");
     }
 
     #[test]
     fn test_add_source_with_prefix() {
-        let mut analyzer = RustAnalyzer::new();
+        let mut analyzer = RustAnalyzer::new("");
 
         let source = r#"
             /// A user in the system
@@ -715,7 +716,7 @@ mod tests {
 
     #[test]
     fn test_add_source_with_file_path() {
-        let mut analyzer = RustAnalyzer::new();
+        let mut analyzer = RustAnalyzer::new("");
 
         let source = r#"
             pub struct Config {
@@ -735,7 +736,7 @@ mod tests {
 
     #[test]
     fn test_add_type_directly() {
-        let mut analyzer = RustAnalyzer::new();
+        let mut analyzer = RustAnalyzer::new("");
 
         let type_info = TypeInfo {
             name: "crate::MyType".to_string(),
@@ -762,7 +763,7 @@ mod tests {
 
     #[test]
     fn test_remove_type() {
-        let mut analyzer = RustAnalyzer::new();
+        let mut analyzer = RustAnalyzer::new("");
 
         analyzer.add_type(TypeInfo {
             name: "crate::ToRemove".to_string(),
@@ -783,7 +784,7 @@ mod tests {
 
     #[test]
     fn test_clear() {
-        let mut analyzer = RustAnalyzer::new();
+        let mut analyzer = RustAnalyzer::new("");
 
         analyzer
             .add_source_with_prefix("crate", "pub struct A {} pub struct B {}")
@@ -798,7 +799,7 @@ mod tests {
 
     #[test]
     fn test_type_alias() {
-        let mut analyzer = RustAnalyzer::new();
+        let mut analyzer = RustAnalyzer::new("");
 
         analyzer.add_type(TypeInfo {
             name: "crate::RealType".to_string(),
@@ -820,7 +821,7 @@ mod tests {
 
     #[test]
     fn test_inline_module() {
-        let mut analyzer = RustAnalyzer::new();
+        let mut analyzer = RustAnalyzer::new("");
 
         let source = r#"
             pub mod inner {
@@ -838,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_simple_name_lookup() {
-        let mut analyzer = RustAnalyzer::new();
+        let mut analyzer = RustAnalyzer::new("");
 
         analyzer.add_type(TypeInfo {
             name: "crate::deeply::nested::MyStruct".to_string(),
