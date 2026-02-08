@@ -1,7 +1,9 @@
 /// Tree-sitter based RON formatter
 /// This formatter uses the AST to properly handle formatting
-
-use crate::{annotation_parser, ts_utils::{self, RonParser}};
+use crate::{
+    annotation_parser,
+    ts_utils::{self, RonParser},
+};
 use tree_sitter::Node;
 
 /// Format RON content using tree-sitter AST
@@ -139,7 +141,14 @@ fn format_struct(
             if !should_inline {
                 output.push_str(&indent_str.repeat(indent_level + 1));
             }
-            format_node(child, content, output, indent_level + 1, indent_str, should_inline);
+            format_node(
+                child,
+                content,
+                output,
+                indent_level + 1,
+                indent_str,
+                should_inline,
+            );
 
             if i < values.len() - 1 {
                 output.push(',');
@@ -206,7 +215,14 @@ fn format_array(
 
         for (i, element) in elements.iter().enumerate() {
             output.push_str(&indent_str.repeat(indent_level + 1));
-            format_node(element, content, output, indent_level + 1, indent_str, false);
+            format_node(
+                element,
+                content,
+                output,
+                indent_level + 1,
+                indent_str,
+                false,
+            );
 
             if i < elements.len() - 1 {
                 output.push(',');
@@ -253,10 +269,24 @@ fn format_map(
             let children = ts_utils::named_children(entry);
             if children.len() >= 2 {
                 // Key
-                format_node(&children[0], content, output, indent_level + 1, indent_str, false);
+                format_node(
+                    &children[0],
+                    content,
+                    output,
+                    indent_level + 1,
+                    indent_str,
+                    false,
+                );
                 output.push_str(": ");
                 // Value
-                format_node(&children[1], content, output, indent_level + 1, indent_str, false);
+                format_node(
+                    &children[1],
+                    content,
+                    output,
+                    indent_level + 1,
+                    indent_str,
+                    false,
+                );
             }
 
             if i < entries.len() - 1 {
@@ -291,7 +321,14 @@ fn format_tuple(
 
         for (i, element) in elements.iter().enumerate() {
             output.push_str(&indent_str.repeat(indent_level + 1));
-            format_node(element, content, output, indent_level + 1, indent_str, false);
+            format_node(
+                element,
+                content,
+                output,
+                indent_level + 1,
+                indent_str,
+                false,
+            );
 
             if i < elements.len() - 1 {
                 output.push(',');

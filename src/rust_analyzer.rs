@@ -164,7 +164,7 @@ impl<'de> serde::Deserialize<'de> for RustAnalyzer {
                     workspace_root: RwLock::new(None),
                     type_cache: RwLock::new(type_cache),
                     type_aliases: RwLock::new(type_aliases),
-                    initial_scan_complete: RwLock::new(false),
+                    initial_scan_complete: RwLock::new(true),
                 })
             }
         }
@@ -280,7 +280,6 @@ impl RustAnalyzer {
             }
         }
     }
-
 
     /// Convert a file path to a module path
     ///
@@ -456,8 +455,8 @@ impl RustAnalyzer {
                                 })
                                 .unzip();
 
-
-                            let field_attributes = serde_attributes::extract_serde_field_attributes(field);
+                            let field_attributes =
+                                serde_attributes::extract_serde_field_attributes(field);
                             let has_default = field_attributes.has_default;
 
                             FieldInfo {
@@ -466,7 +465,7 @@ impl RustAnalyzer {
                                 docs: field_docs,
                                 line,
                                 column,
-                                has_default
+                                has_default,
                             }
                         })
                         .collect(),
@@ -477,7 +476,8 @@ impl RustAnalyzer {
                         .map(|(i, field)| {
                             let type_name = type_to_string(&field.ty);
 
-                            let field_attributes = serde_attributes::extract_serde_field_attributes(field);
+                            let field_attributes =
+                                serde_attributes::extract_serde_field_attributes(field);
                             let has_default = field_attributes.has_default;
 
                             FieldInfo {
@@ -565,7 +565,8 @@ impl RustAnalyzer {
                 if key.ends_with(&format!("::{}", type_path))
                     || key.ends_with(&format!("::{}", resolved_type))
                     || key == type_path
-                    || key == &resolved_type {
+                    || key == &resolved_type
+                {
                     return Some(value.clone());
                 }
             }
@@ -721,5 +722,3 @@ mod tests {
         assert!(deserialized.get_type_info("Test").await.is_some());
     }
 }
-
-

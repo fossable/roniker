@@ -1,7 +1,7 @@
-use std::fs;
-use std::path::{Path, PathBuf};
 use globset::{Glob, GlobMatcher};
 use serde::{Deserialize, Deserializer};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub const CONFIG_FILE_NAME: &str = "ron.toml";
 
@@ -9,7 +9,7 @@ pub const CONFIG_FILE_NAME: &str = "ron.toml";
 pub struct Config {
     /// Map glob pattern to file path
     #[serde(default)]
-    types: Vec<TypePattern>,
+    pub types: Vec<TypePattern>,
 
     #[serde(default)]
     pub root_dir: Option<PathBuf>,
@@ -40,25 +40,39 @@ impl Config {
             .and_then(|root| file_path.strip_prefix(root).ok())
             .unwrap_or(file_path);
 
-        self.types.iter().find_map(|TypePattern { glob, path }| {
-            if glob.is_match(rel) {
-                Some(path)
-            } else {
-                None
-            }
-        })
+        self.types.iter().find_map(
+            |TypePattern { glob, path }| {
+                if glob.is_match(rel) {
+                    Some(path)
+                } else {
+                    None
+                }
+            },
+        )
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct TypePattern {
+pub struct TypePattern {
     #[serde(deserialize_with = "deserialize_glob")]
-    glob: GlobMatcher,
+    pub glob: GlobMatcher,
     #[serde(rename = "type")]
-    path: String,
+    pub path: String,
 }
 
-fn deserialize_glob<'de, D>(deserializer: D) -> Result<GlobMatcher, D::Error> where D: Deserializer<'de> {
+impl TypePattern {
+    pub fn new(pattern: &str, type_path: String) -> Result<Self, globset::Error> {
+        Ok(Self {
+            glob: Glob::new(pattern)?.compile_matcher(),
+            path: type_path,
+        })
+    }
+}
+
+fn deserialize_glob<'de, D>(deserializer: D) -> Result<GlobMatcher, D::Error>
+where
+    D: Deserializer<'de>,
+{
     String::deserialize(deserializer)
         .and_then(|glob| Glob::new(&glob).map_err(serde::de::Error::custom))
         .map(|glob| glob.compile_matcher())
@@ -71,12 +85,10 @@ mod tests {
     #[test]
     fn test_match_module_path() {
         let config = Config {
-            types: vec![
-                TypePattern {
-                    glob: Glob::new("**/post.ron").unwrap().compile_matcher(),
-                    path: "crate::models::Post".to_string(),
-                }
-            ],
+            types: vec![TypePattern {
+                glob: Glob::new("**/post.ron").unwrap().compile_matcher(),
+                path: "crate::models::Post".to_string(),
+            }],
             root_dir: Some("Bobby".into()),
         };
 

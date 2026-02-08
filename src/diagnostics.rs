@@ -1,8 +1,8 @@
 #[cfg(feature = "cli")]
 use crate::diagnostic_reporter;
+use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use crate::tree_sitter_parser;
 use crate::ts_utils::ParsedEnumVariant;
-use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use ron::Value;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
@@ -66,14 +66,17 @@ pub async fn validate_ron_with_analyzer(
     }
 
     // Check for enum variant fields (scans the whole file, so only call once)
-    diagnostics.extend(
-        validate_enum_variant_fields_in_structs(content, type_info, &analyzer).await,
-    );
+    diagnostics
+        .extend(validate_enum_variant_fields_in_structs(content, type_info, &analyzer).await);
 
     // Deduplicate diagnostics by message and position
     let mut seen = std::collections::HashSet::new();
     diagnostics.retain(|d| {
-        let key = (d.range.start.line, d.range.start.character, d.message.clone());
+        let key = (
+            d.range.start.line,
+            d.range.start.character,
+            d.message.clone(),
+        );
         seen.insert(key)
     });
 
@@ -91,8 +94,10 @@ async fn validate_enum_variant_fields_in_structs(
 
     // Collect all variant locations and group by variant to check for missing fields
     let variant_locations = tree_sitter_parser::find_all_variant_field_locations(content);
-    let mut variant_info: std::collections::HashMap<(String, String), (usize, std::collections::HashSet<String>)> =
-        std::collections::HashMap::new();
+    let mut variant_info: std::collections::HashMap<
+        (String, String),
+        (usize, std::collections::HashSet<String>),
+    > = std::collections::HashMap::new();
 
     // Cache for variant type lookups: (containing_field_name, variant_name) -> Option<EnumVariant>
     let mut variant_cache: std::collections::HashMap<(String, String), Option<EnumVariant>> =
@@ -101,8 +106,13 @@ async fn validate_enum_variant_fields_in_structs(
     // First pass: collect all fields present for each variant
     let lines: Vec<&str> = content.lines().collect();
     for location in &variant_locations {
-        let key = (location.containing_field_name.clone(), location.variant_name.clone());
-        let entry = variant_info.entry(key).or_insert((location.line_idx, std::collections::HashSet::new()));
+        let key = (
+            location.containing_field_name.clone(),
+            location.variant_name.clone(),
+        );
+        let entry = variant_info
+            .entry(key)
+            .or_insert((location.line_idx, std::collections::HashSet::new()));
         if let Some(ref field_at_pos) = location.field_at_position {
             entry.1.insert(field_at_pos.clone());
         }
@@ -118,9 +128,15 @@ async fn validate_enum_variant_fields_in_structs(
         // Do the expensive navigation once per unique variant
         let position = Position::new(*first_line as u32, 0);
         let mut contexts = vec![tree_sitter_parser::TypeContext {
-            type_name: type_info.name.split("::").last().unwrap_or(&type_info.name).to_string(),
+            type_name: type_info
+                .name
+                .split("::")
+                .last()
+                .unwrap_or(&type_info.name)
+                .to_string(),
         }];
-        let mut position_contexts = tree_sitter_parser::find_type_context_at_position(content, position);
+        let mut position_contexts =
+            tree_sitter_parser::find_type_context_at_position(content, position);
         if !position_contexts.is_empty() {
             position_contexts.pop();
         }
@@ -137,7 +153,8 @@ async fn validate_enum_variant_fields_in_structs(
                 let context_name = &context.type_name;
                 if let Some(field) = fields.iter().find(|f| {
                     let field_type_last = f.type_name.split("::").last().unwrap_or(&f.type_name);
-                    let field_type_base = field_type_last.split('<').next().unwrap_or(field_type_last);
+                    let field_type_base =
+                        field_type_last.split('<').next().unwrap_or(field_type_last);
                     field_type_base == context_name
                 }) {
                     current_type_info = analyzer.get_type_info(&field.type_name).await;
@@ -160,7 +177,9 @@ async fn validate_enum_variant_fields_in_structs(
                 if !found_via_variant {
                     if let Some(fields) = info.fields() {
                         for field in fields {
-                            if let Some(field_type_info) = analyzer.get_type_info(&field.type_name).await {
+                            if let Some(field_type_info) =
+                                analyzer.get_type_info(&field.type_name).await
+                            {
                                 if field_type_info.find_variant(&context.type_name).is_some() {
                                     current_type_info = Some(field_type_info);
                                     found_via_variant = true;
@@ -191,7 +210,10 @@ async fn validate_enum_variant_fields_in_structs(
             None
         };
 
-        variant_cache.insert((containing_field_name.clone(), variant_name.clone()), variant);
+        variant_cache.insert(
+            (containing_field_name.clone(), variant_name.clone()),
+            variant,
+        );
     }
 
     // Third pass: check all field locations using cached variant info
@@ -199,19 +221,30 @@ async fn validate_enum_variant_fields_in_structs(
         if let Some(ref field_at_pos) = location.field_at_position {
             let error_key = (location.line_idx, field_at_pos.clone());
             if !reported_errors.contains(&error_key) {
-                let cache_key = (location.containing_field_name.clone(), location.variant_name.clone());
+                let cache_key = (
+                    location.containing_field_name.clone(),
+                    location.variant_name.clone(),
+                );
                 if let Some(Some(variant)) = variant_cache.get(&cache_key) {
                     if !variant.fields.iter().any(|f| f.name == *field_at_pos) {
                         let line = lines.get(location.line_idx).unwrap_or(&"");
-                        if let Some(col) = line.find(&format!("{}:", field_at_pos))
-                            .or_else(|| line.find(&format!("{} :", field_at_pos))) {
+                        if let Some(col) = line
+                            .find(&format!("{}:", field_at_pos))
+                            .or_else(|| line.find(&format!("{} :", field_at_pos)))
+                        {
                             diagnostics.push(Diagnostic {
                                 range: Range::new(
                                     Position::new(location.line_idx as u32, col as u32),
-                                    Position::new(location.line_idx as u32, (col + field_at_pos.len()) as u32),
+                                    Position::new(
+                                        location.line_idx as u32,
+                                        (col + field_at_pos.len()) as u32,
+                                    ),
                                 ),
                                 severity: Some(DiagnosticSeverity::ERROR),
-                                message: format!("Unknown field '{}' in variant '{}'", field_at_pos, location.variant_name),
+                                message: format!(
+                                    "Unknown field '{}' in variant '{}'",
+                                    field_at_pos, location.variant_name
+                                ),
                                 ..Default::default()
                             });
                             reported_errors.insert(error_key);
@@ -228,8 +261,8 @@ async fn validate_enum_variant_fields_in_structs(
         if let Some(Some(variant)) = variant_cache.get(&cache_key) {
             // Check for missing required fields
             for vfield in &variant.fields {
-                if !present_fields.contains(&vfield.name)
-                    && !vfield.type_name.starts_with("Option") {
+                if !present_fields.contains(&vfield.name) && !vfield.type_name.starts_with("Option")
+                {
                     // Note: We don't have has_default info in the cached variant,
                     // but typically enum variants don't have defaults
 
@@ -250,10 +283,16 @@ async fn validate_enum_variant_fields_in_structs(
                     diagnostics.push(Diagnostic {
                         range: Range::new(
                             Position::new(variant_line_idx as u32, variant_col as u32),
-                            Position::new(variant_line_idx as u32, (variant_col + variant_name.len()) as u32),
+                            Position::new(
+                                variant_line_idx as u32,
+                                (variant_col + variant_name.len()) as u32,
+                            ),
                         ),
                         severity: Some(DiagnosticSeverity::ERROR),
-                        message: format!("Missing required field '{}' in variant '{}'", vfield.name, variant_name),
+                        message: format!(
+                            "Missing required field '{}' in variant '{}'",
+                            vfield.name, variant_name
+                        ),
                         ..Default::default()
                     });
                 }
@@ -359,18 +398,27 @@ async fn validate_struct_fields(
                 if let Some(field_value) = map.get(&Value::String(field.name.clone())) {
                     // For custom types (structs/enums), recursively validate
                     if let Some(analyzer) = analyzer {
-                        if !is_primitive_type(&field.type_name) && !is_std_generic_type(&field.type_name) {
-                            if let Some(nested_type_info) = analyzer.get_type_info(&field.type_name).await {
+                        if !is_primitive_type(&field.type_name)
+                            && !is_std_generic_type(&field.type_name)
+                        {
+                            if let Some(nested_type_info) =
+                                analyzer.get_type_info(&field.type_name).await
+                            {
                                 // Use pre-extracted position and content
                                 if let Some(&(line_num, _, _)) = field_positions.get(&field.name) {
                                     if let Some(field_content) = field_contents.get(&field.name) {
-                                        let mut nested_diags = Box::pin(validate_ron_with_analyzer(
-                                            field_content,
-                                            &nested_type_info,
-                                            analyzer.clone(),
-                                        )).await;
+                                        let mut nested_diags =
+                                            Box::pin(validate_ron_with_analyzer(
+                                                field_content,
+                                                &nested_type_info,
+                                                analyzer.clone(),
+                                            ))
+                                            .await;
                                         // Adjust line numbers to match the original file
-                                        nested_diags = adjust_diagnostic_positions(nested_diags, line_num as u32);
+                                        nested_diags = adjust_diagnostic_positions(
+                                            nested_diags,
+                                            line_num as u32,
+                                        );
                                         diagnostics.extend(nested_diags);
                                         continue; // Skip type checking since we did full validation
                                     }
@@ -400,7 +448,9 @@ async fn validate_struct_fields(
 
                     if let Some(error_msg) = type_mismatch {
                         // Use pre-computed position
-                        if let Some(&(line_num, col_start, col_end)) = field_positions.get(&field.name) {
+                        if let Some(&(line_num, col_start, col_end)) =
+                            field_positions.get(&field.name)
+                        {
                             diagnostics.push(Diagnostic {
                                 range: Range::new(
                                     Position::new(line_num as u32, col_start as u32),
@@ -422,9 +472,7 @@ async fn validate_struct_fields(
     if !has_default {
         let missing_fields: Vec<_> = fields
             .iter()
-            .filter(|field| {
-                !ron_fields.contains(&field.name) && !field.is_optional()
-            })
+            .filter(|field| !ron_fields.contains(&field.name) && !field.is_optional())
             .collect();
 
         if !missing_fields.is_empty() {
@@ -482,7 +530,8 @@ async fn validate_enum_variant_with_fields(
                     let mut field_diagnostics =
                         validate_variant_field_data(data, &variant_def.fields, analyzer).await;
                     // Adjust positions to account for the variant line offset
-                    field_diagnostics = adjust_diagnostic_positions(field_diagnostics, variant.line);
+                    field_diagnostics =
+                        adjust_diagnostic_positions(field_diagnostics, variant.line);
                     diagnostics.extend(field_diagnostics);
                 }
             }
@@ -536,34 +585,50 @@ async fn validate_node_with_type_info<'a>(
                                 let field_type_normalized = field_info.type_name.replace(" ", "");
 
                                 // Handle Vec<CustomType>
-                                if let Some(inner_type) = extract_inner_type(&field_type_normalized, "Vec<") {
-                                    if !is_primitive_type(&inner_type) && !is_std_generic_type(&inner_type) {
-                                        if let Some(inner_type_info) = analyzer.get_type_info(&inner_type).await {
+                                if let Some(inner_type) =
+                                    extract_inner_type(&field_type_normalized, "Vec<")
+                                {
+                                    if !is_primitive_type(&inner_type)
+                                        && !is_std_generic_type(&inner_type)
+                                    {
+                                        if let Some(inner_type_info) =
+                                            analyzer.get_type_info(&inner_type).await
+                                        {
                                             if value_node.kind() == "array" {
                                                 let mut cursor = value_node.walk();
                                                 for elem_node in value_node.children(&mut cursor) {
-                                                    if elem_node.kind() != "[" && elem_node.kind() != "]" && elem_node.kind() != "," {
-                                                        let elem_diags = Box::pin(validate_node_with_type_info(
-                                                            &elem_node,
-                                                            content,
-                                                            &inner_type_info,
-                                                            analyzer,
-                                                        )).await;
+                                                    if elem_node.kind() != "["
+                                                        && elem_node.kind() != "]"
+                                                        && elem_node.kind() != ","
+                                                    {
+                                                        let elem_diags =
+                                                            Box::pin(validate_node_with_type_info(
+                                                                &elem_node,
+                                                                content,
+                                                                &inner_type_info,
+                                                                analyzer,
+                                                            ))
+                                                            .await;
                                                         diagnostics.extend(elem_diags);
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                } else if !is_primitive_type(&field_type_normalized) && !is_std_generic_type(&field_type_normalized) {
+                                } else if !is_primitive_type(&field_type_normalized)
+                                    && !is_std_generic_type(&field_type_normalized)
+                                {
                                     // Custom non-generic type - validate recursively
-                                    if let Some(nested_type_info) = analyzer.get_type_info(&field_info.type_name).await {
+                                    if let Some(nested_type_info) =
+                                        analyzer.get_type_info(&field_info.type_name).await
+                                    {
                                         let nested_diags = Box::pin(validate_node_with_type_info(
                                             &value_node,
                                             content,
                                             &nested_type_info,
                                             analyzer,
-                                        )).await;
+                                        ))
+                                        .await;
                                         diagnostics.extend(nested_diags);
                                     }
                                 }
@@ -590,9 +655,12 @@ async fn validate_node_with_type_info<'a>(
                             diagnostics.push(Diagnostic {
                                 range,
                                 severity: Some(DiagnosticSeverity::ERROR),
-                                message: format!("Required fields: {}",
-                                    fields.iter()
-                                        .filter(|f| !present_fields.contains(&f.name) && !f.type_name.starts_with("Option"))
+                                message: format!(
+                                    "Required fields: {}",
+                                    fields
+                                        .iter()
+                                        .filter(|f| !present_fields.contains(&f.name)
+                                            && !f.type_name.starts_with("Option"))
                                         .map(|f| f.name.as_str())
                                         .collect::<Vec<_>>()
                                         .join(", ")
@@ -640,13 +708,17 @@ async fn validate_variant_field_data(
                             if array_node.kind() == "array" {
                                 let mut cursor = array_node.walk();
                                 for elem_node in array_node.children(&mut cursor) {
-                                    if elem_node.kind() != "[" && elem_node.kind() != "]" && elem_node.kind() != "," {
+                                    if elem_node.kind() != "["
+                                        && elem_node.kind() != "]"
+                                        && elem_node.kind() != ","
+                                    {
                                         let elem_diags = Box::pin(validate_node_with_type_info(
                                             &elem_node,
                                             data,
                                             &nested_type_info,
                                             analyzer,
-                                        )).await;
+                                        ))
+                                        .await;
                                         diagnostics.extend(elem_diags);
                                     }
                                 }
@@ -659,7 +731,12 @@ async fn validate_variant_field_data(
         } else if !is_primitive_type(field_type) {
             // Non-generic custom type - recursively validate
             if let Some(nested_type_info) = analyzer.get_type_info(field_type).await {
-                let nested_diags = Box::pin(validate_ron_with_analyzer(data, &nested_type_info, analyzer.clone())).await;
+                let nested_diags = Box::pin(validate_ron_with_analyzer(
+                    data,
+                    &nested_type_info,
+                    analyzer.clone(),
+                ))
+                .await;
                 diagnostics.extend(nested_diags);
                 return diagnostics;
             }
@@ -669,7 +746,9 @@ async fn validate_variant_field_data(
     // Try to parse the data as RON
     // For struct variants, the data contains named fields like "field1: val, field2: val"
     // For tuple variants, the data contains unnamed values like "val1, val2"
-    let has_named_fields = expected_fields.iter().any(|f| f.name.parse::<usize>().is_err());
+    let has_named_fields = expected_fields
+        .iter()
+        .any(|f| f.name.parse::<usize>().is_err());
 
     let parsed_data = if has_named_fields {
         // Struct-like variant: wrap the named fields in parentheses for RON parsing
@@ -686,7 +765,10 @@ async fn validate_variant_field_data(
     match parsed_data {
         Ok(value) => {
             // Validate fields based on whether it's named or unnamed
-            if expected_fields.iter().all(|f| f.name.parse::<usize>().is_err()) {
+            if expected_fields
+                .iter()
+                .all(|f| f.name.parse::<usize>().is_err())
+            {
                 // Named fields (struct-like variant)
                 if let Some(map) = extract_map_from_value(&value) {
                     // First, check for unknown fields - extract from the parsed value, not raw data
@@ -712,7 +794,10 @@ async fn validate_variant_field_data(
                                 diagnostics.push(Diagnostic {
                                     range: Range::new(Position::new(0, 0), Position::new(0, 1)),
                                     severity: Some(DiagnosticSeverity::ERROR),
-                                    message: format!("Type mismatch in variant field: {}", error_msg),
+                                    message: format!(
+                                        "Type mismatch in variant field: {}",
+                                        error_msg
+                                    ),
                                     ..Default::default()
                                 });
                             }
@@ -781,7 +866,6 @@ async fn validate_variant_field_data(
     diagnostics
 }
 
-
 /// Extract a map from a RON value (handles both raw maps and named struct syntax)
 fn extract_map_from_value(value: &Value) -> Option<&ron::Map> {
     match value {
@@ -823,7 +907,6 @@ fn is_std_generic_type(type_name: &str) -> bool {
         || clean.starts_with("Arc<")
 }
 
-
 /// Extract the variant name and data from raw RON text using tree-sitter
 /// Enums can be: Simple (Long), tuple (Long(...)), or struct-like (Long { ... })
 fn extract_enum_variant_from_text(content: &str) -> Option<ParsedEnumVariant> {
@@ -840,7 +923,6 @@ fn extract_enum_variant_from_text(content: &str) -> Option<ParsedEnumVariant> {
         content
     };
 
-
     let mut parser = RonParser::new();
     let tree = parser.parse(ron_content)?;
 
@@ -850,7 +932,6 @@ fn extract_enum_variant_from_text(content: &str) -> Option<ParsedEnumVariant> {
     let main_value = main_value?;
     ts_utils::extract_enum_variant(&main_value, ron_content)
 }
-
 
 /// Find the position of an enum variant in the content using tree-sitter
 #[allow(dead_code)]
@@ -1354,8 +1435,6 @@ fn simplify_ron_error(error_msg: &str) -> String {
 mod tests {
     use super::*;
     use crate::rust_analyzer::{EnumVariant, FieldInfo};
-
-
 
     #[tokio::test]
     async fn test_enum_variant_validation() {
@@ -1885,9 +1964,10 @@ PostReference(Post(
         let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
         // Should get error for providing data to unit variant
         assert!(
-            diagnostics.iter().any(|d| d
-                .message
-                .contains("unit variant") || d.message.contains("cannot have data")),
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("unit variant")
+                    || d.message.contains("cannot have data")),
             "Should error on unit variant with data. Got: {:?}",
             diagnostics
         );
@@ -1991,10 +2071,17 @@ PostReference(Post(
         // We expect errors about missing fields
         // First User(age: 22) is missing: id, name, email, is_active, roles
         // Second User(email: "hello") is missing: id, name, age, is_active, roles
-        assert!(!diagnostics.is_empty(), "Expected diagnostics for missing fields");
+        assert!(
+            !diagnostics.is_empty(),
+            "Expected diagnostics for missing fields"
+        );
 
         // Should have 2 diagnostics, one for each struct with missing fields
-        assert_eq!(diagnostics.len(), 2, "Expected 2 diagnostics (one per struct)");
+        assert_eq!(
+            diagnostics.len(),
+            2,
+            "Expected 2 diagnostics (one per struct)"
+        );
 
         // Check first struct error
         assert!(

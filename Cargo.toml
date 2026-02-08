@@ -10,6 +10,10 @@ exclude = [
     "vscode-extension",
 ]
 
+[lib]
+name = "ron_lsp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ron-lsp"
 path = "src/main.rs"
