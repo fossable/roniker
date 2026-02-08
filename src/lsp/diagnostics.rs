@@ -1,6 +1,6 @@
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
-use crate::tree_sitter_parser;
-use crate::ts_utils::ParsedEnumVariant;
+use super::tree_sitter_parser;
+use super::ts_utils::ParsedEnumVariant;
 use ron::Value;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
@@ -144,12 +144,12 @@ async fn validate_enum_variant_fields_in_structs(
                         field_type_last.split('<').next().unwrap_or(field_type_last);
                     field_type_base == context_name
                 }) {
-                    current_type_info = analyzer.get_type_info(&field.type_name).await;
+                    current_type_info = analyzer.get_type_info(&field.type_name).cloned();
                     continue;
                 }
             }
 
-            let direct_lookup = analyzer.get_type_info(&context.type_name).await;
+            let direct_lookup = analyzer.get_type_info(&context.type_name).cloned();
             if direct_lookup.is_some() {
                 current_type_info = direct_lookup;
             } else {
@@ -157,7 +157,7 @@ async fn validate_enum_variant_fields_in_structs(
                 if let Some(variant) = info.find_variant(&context.type_name) {
                     if variant.fields.len() == 1 {
                         let field_type = &variant.fields[0].type_name;
-                        current_type_info = analyzer.get_type_info(field_type).await;
+                        current_type_info = analyzer.get_type_info(field_type).cloned();
                         found_via_variant = true;
                     }
                 }
@@ -165,7 +165,7 @@ async fn validate_enum_variant_fields_in_structs(
                     if let Some(fields) = info.fields() {
                         for field in fields {
                             if let Some(field_type_info) =
-                                analyzer.get_type_info(&field.type_name).await
+                                analyzer.get_type_info(&field.type_name).cloned()
                             {
                                 if field_type_info.find_variant(&context.type_name).is_some() {
                                     current_type_info = Some(field_type_info);
@@ -185,7 +185,7 @@ async fn validate_enum_variant_fields_in_structs(
         // Look up the variant and cache it
         let variant = if let Some(current_type) = current_type_info {
             if let Some(field) = current_type.find_field(containing_field_name) {
-                if let Some(field_type_info) = analyzer.get_type_info(&field.type_name).await {
+                if let Some(field_type_info) = analyzer.get_type_info(&field.type_name).cloned() {
                     field_type_info.find_variant(variant_name).cloned()
                 } else {
                     None
@@ -316,7 +316,7 @@ async fn validate_struct_fields(
     let ron_fields = tree_sitter_parser::extract_fields_from_ron(content);
 
     // Check for unknown fields in RON using tree-sitter for position
-    use crate::ts_utils::{self, RonParser};
+    use super::ts_utils::{self, RonParser};
     let mut parser = RonParser::new();
     if let Some(tree) = parser.parse(content) {
         if let Some(main_value) = ts_utils::find_main_value(&tree) {
@@ -366,7 +366,7 @@ async fn validate_struct_fields(
                             && !is_std_generic_type(&field.type_name)
                         {
                             if let Some(nested_type_info) =
-                                analyzer.get_type_info(&field.type_name).await
+                                analyzer.get_type_info(&field.type_name).cloned()
                             {
                                 // Use pre-extracted position and content
                                 if let Some(&(line_num, _, _)) = field_positions.get(&field.name) {
@@ -527,7 +527,7 @@ async fn validate_node_with_type_info<'a>(
     type_info: &TypeInfo,
     analyzer: &Arc<RustAnalyzer>,
 ) -> Vec<Diagnostic> {
-    use crate::ts_utils;
+    use super::ts_utils;
     let mut diagnostics = Vec::new();
 
     match &type_info.kind {
@@ -556,7 +556,7 @@ async fn validate_node_with_type_info<'a>(
                                         && !is_std_generic_type(&inner_type)
                                     {
                                         if let Some(inner_type_info) =
-                                            analyzer.get_type_info(&inner_type).await
+                                            analyzer.get_type_info(&inner_type).cloned()
                                         {
                                             if value_node.kind() == "array" {
                                                 let mut cursor = value_node.walk();
@@ -584,7 +584,7 @@ async fn validate_node_with_type_info<'a>(
                                 {
                                     // Custom non-generic type - validate recursively
                                     if let Some(nested_type_info) =
-                                        analyzer.get_type_info(&field_info.type_name).await
+                                        analyzer.get_type_info(&field_info.type_name).cloned()
                                     {
                                         let nested_diags = Box::pin(validate_node_with_type_info(
                                             &value_node,
@@ -662,9 +662,9 @@ async fn validate_variant_field_data(
         // Check if it's Vec<CustomType>
         if let Some(inner_type) = extract_inner_type(&normalized_type, "Vec<") {
             if !is_primitive_type(&inner_type) && !is_std_generic_type(&inner_type) {
-                if let Some(nested_type_info) = analyzer.get_type_info(&inner_type).await {
+                if let Some(nested_type_info) = analyzer.get_type_info(&inner_type).cloned() {
                     // Parse with tree-sitter
-                    use crate::ts_utils::{self, RonParser};
+                    use super::ts_utils::{self, RonParser};
                     let mut parser = RonParser::new();
 
                     if let Some(tree) = parser.parse(data) {
@@ -694,7 +694,7 @@ async fn validate_variant_field_data(
             }
         } else if !is_primitive_type(field_type) {
             // Non-generic custom type - recursively validate
-            if let Some(nested_type_info) = analyzer.get_type_info(field_type).await {
+            if let Some(nested_type_info) = analyzer.get_type_info(field_type).cloned() {
                 let nested_diags = Box::pin(validate_ron_with_analyzer(
                     data,
                     &nested_type_info,
@@ -874,7 +874,7 @@ fn is_std_generic_type(type_name: &str) -> bool {
 /// Extract the variant name and data from raw RON text using tree-sitter
 /// Enums can be: Simple (Long), tuple (Long(...)), or struct-like (Long { ... })
 fn extract_enum_variant_from_text(content: &str) -> Option<ParsedEnumVariant> {
-    use crate::ts_utils::{self, RonParser};
+    use super::ts_utils::{self, RonParser};
 
     // Skip type annotation if present
     let ron_content = if content.trim_start().starts_with("/*") {
@@ -900,7 +900,7 @@ fn extract_enum_variant_from_text(content: &str) -> Option<ParsedEnumVariant> {
 /// Find the position of an enum variant in the content using tree-sitter
 #[allow(dead_code)]
 fn find_variant_position(content: &str, variant: &str) -> (u32, u32) {
-    use crate::ts_utils::{self, RonParser};
+    use super::ts_utils::{self, RonParser};
 
     let mut parser = RonParser::new();
     if let Some(tree) = parser.parse(content) {
@@ -921,7 +921,7 @@ fn find_variant_position(content: &str, variant: &str) -> (u32, u32) {
 /// Find the position of the struct name in the RON content using tree-sitter
 /// Returns (line, col_start, col_end) where col_start == col_end indicates unnamed struct
 fn find_struct_name_position(content: &str) -> (u32, u32, u32) {
-    use crate::ts_utils::{self, RonParser};
+    use super::ts_utils::{self, RonParser};
 
     let mut parser = RonParser::new();
     if let Some(tree) = parser.parse(content) {
@@ -946,7 +946,7 @@ fn find_struct_name_position(content: &str) -> (u32, u32, u32) {
 
 /// Find the position of a field's value in the content using tree-sitter
 fn find_field_value_position(content: &str, field_name: &str) -> Option<(usize, usize, usize)> {
-    use crate::ts_utils::{self, RonParser};
+    use super::ts_utils::{self, RonParser};
 
     let mut parser = RonParser::new();
     let tree = parser.parse(content)?;
@@ -991,7 +991,7 @@ async fn check_type_mismatch_with_enum_validation(
             let trimmed = field_value_text.trim();
 
             // Check if the type is an enum
-            if let Some(type_info) = analyzer.get_type_info(expected_type).await {
+            if let Some(type_info) = analyzer.get_type_info(expected_type).cloned() {
                 if let TypeKind::Enum(variants) = &type_info.kind {
                     // Extract the variant name from the text
                     let variant_name = trimmed.split('(').next().unwrap_or(trimmed).trim();
@@ -1076,7 +1076,7 @@ fn check_type_mismatch_deep(
 
 /// Extract the raw text value for a field, handling nested structures
 fn extract_field_value_text(content: &str, field_name: &str) -> Option<String> {
-    use crate::ts_utils::{self, RonParser};
+    use super::ts_utils::{self, RonParser};
 
     let mut parser = RonParser::new();
     let tree = parser.parse(content)?;
@@ -1939,8 +1939,6 @@ PostReference(Post(
 
     #[tokio::test]
     async fn test_enum_with_vec_of_custom_type_missing_fields() {
-        let analyzer = Arc::new(RustAnalyzer::new());
-
         // Create User type info
         let user_type = TypeInfo {
             name: "User".to_string(),
@@ -2002,7 +2000,9 @@ PostReference(Post(
         };
 
         // Register User type with the analyzer
-        analyzer.insert_type_for_test(user_type).await;
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(user_type);
+        let analyzer = Arc::new(analyzer);
 
         // Create Message enum with UserTag variant
         let type_info = TypeInfo {

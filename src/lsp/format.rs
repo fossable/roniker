@@ -1,6 +1,6 @@
 /// Tree-sitter based RON formatter
 /// This formatter uses the AST to properly handle formatting
-use crate::ts_utils::{self, RonParser};
+use super::ts_utils::{self, RonParser};
 use tree_sitter::Node;
 
 /// Format RON content using tree-sitter AST

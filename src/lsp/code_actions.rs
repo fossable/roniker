@@ -1,5 +1,5 @@
 use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
-use crate::tree_sitter_parser;
+use super::tree_sitter_parser;
 use std::sync::Arc;
 use tower_lsp::Client;
 use tower_lsp::lsp_types::*;
@@ -175,7 +175,7 @@ async fn generate_missing_variant_field_actions(
 
         if let Some(field_type_name) = target_type_info {
             // Get the enum type for this field
-            if let Some(field_type_info) = analyzer.get_type_info(&field_type_name).await {
+            if let Some(field_type_info) = analyzer.get_type_info(&field_type_name) {
                 client
                     .log_message(
                         MessageType::INFO,
@@ -446,7 +446,7 @@ fn create_explicit_root_type_action(
     type_info: &TypeInfo,
     uri: &str,
 ) -> Option<CodeActionOrCommand> {
-    use crate::ts_utils::{self, RonParser};
+    use super::ts_utils::{self, RonParser};
 
     let mut parser = RonParser::new();
     let tree = parser.parse(content)?;
@@ -489,7 +489,7 @@ fn create_explicit_field_type_action(
     field: &FieldInfo,
     uri: &str,
 ) -> Option<CodeActionOrCommand> {
-    use crate::ts_utils::{self, RonParser};
+    use super::ts_utils::{self, RonParser};
 
     let mut parser = RonParser::new();
     let tree = parser.parse(content)?;
@@ -555,7 +555,7 @@ fn create_explicit_field_type_action(
 
 /// Generate text edits to insert missing fields using tree-sitter
 fn generate_field_insertions(missing_fields: &[&FieldInfo], content: &str) -> Option<TextEdit> {
-    use crate::ts_utils::{self, RonParser};
+    use super::ts_utils::{self, RonParser};
 
     let mut parser = RonParser::new();
     let tree = parser.parse(content)?;
@@ -984,7 +984,7 @@ mod tests {
         use std::sync::Arc;
 
         let analyzer = Arc::new(RustAnalyzer::new());
-        let (service, _) = tower_lsp::LspService::new(|client| crate::Backend {
+        let (service, _) = tower_lsp::LspService::new(|client| crate::lsp::Backend {
             client: client.clone(),
             documents: Default::default(),
             rust_analyzer: analyzer.clone(),

@@ -1,5 +1,5 @@
 use crate::rust_analyzer::{RustAnalyzer, TypeInfo, TypeKind};
-use crate::tree_sitter_parser;
+use super::tree_sitter_parser;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent, MarkupKind,
@@ -15,7 +15,7 @@ enum CompletionContext {
 
 /// Determine what we're completing based on cursor position using tree-sitter
 fn get_completion_context(content: &str, position: Position) -> CompletionContext {
-    use crate::ts_utils::{self, RonParser};
+    use super::ts_utils::{self, RonParser};
 
     let mut parser = RonParser::new();
     let tree = match parser.parse(content) {
@@ -94,7 +94,7 @@ fn find_current_type_context(content: &str, position: Position) -> Option<String
 
 /// Generate completions for a given type (already navigated to the innermost type)
 /// Type context navigation is now done in main.rs using Backend::navigate_to_innermost_type
-pub async fn generate_completions_for_type(
+pub fn generate_completions_for_type(
     content: &str,
     position: Position,
     type_info: &TypeInfo,
@@ -115,21 +115,20 @@ pub async fn generate_completions_for_type(
                     field_name,
                     effective_type,
                     analyzer.clone(),
-                )
-                .await;
+                );
 
                 // Also add all workspace symbols as potential completions
-                completions.extend(get_all_workspace_types(analyzer).await);
+                completions.extend(get_all_workspace_types(analyzer));
 
                 completions
             } else {
-                get_all_workspace_types(analyzer).await
+                get_all_workspace_types(analyzer)
             }
         }
         CompletionContext::StructType => {
             // Find the field type and provide struct completions
             if let Some(field_name) = find_current_field(content, position) {
-                generate_type_completions_for_field(field_name, effective_type, analyzer).await
+                generate_type_completions_for_field(field_name, effective_type, analyzer)
             } else {
                 Vec::new()
             }
@@ -138,12 +137,11 @@ pub async fn generate_completions_for_type(
 }
 
 /// Get all types from the workspace as completion items
-async fn get_all_workspace_types(analyzer: Arc<RustAnalyzer>) -> Vec<CompletionItem> {
+fn get_all_workspace_types(analyzer: Arc<RustAnalyzer>) -> Vec<CompletionItem> {
     analyzer
         .get_all_types()
-        .await
         .into_iter()
-        .map(|type_info| create_type_completion(&type_info))
+        .map(|type_info| create_type_completion(type_info))
         .collect()
 }
 
@@ -283,7 +281,7 @@ fn find_current_field(content: &str, position: Position) -> Option<String> {
 }
 
 /// Generate value completions for a specific field
-async fn generate_value_completions_for_field(
+fn generate_value_completions_for_field(
     field_name: String,
     type_info: &TypeInfo,
     analyzer: Arc<RustAnalyzer>,
@@ -291,7 +289,7 @@ async fn generate_value_completions_for_field(
     // Find the field in the type info
     if let TypeKind::Struct(fields) = &type_info.kind {
         if let Some(field) = fields.iter().find(|f| f.name == field_name) {
-            return generate_value_completions_by_type(&field.type_name, analyzer).await;
+            return generate_value_completions_by_type(&field.type_name, analyzer);
         }
     }
 
@@ -299,7 +297,7 @@ async fn generate_value_completions_for_field(
 }
 
 /// Generate type completions for a field that expects a custom type
-async fn generate_type_completions_for_field(
+fn generate_type_completions_for_field(
     field_name: String,
     type_info: &TypeInfo,
     analyzer: Arc<RustAnalyzer>,
@@ -311,8 +309,8 @@ async fn generate_type_completions_for_field(
             let inner_type = extract_inner_type(&field.type_name);
 
             // Try to get type info for this type
-            if let Some(nested_type) = analyzer.get_type_info(&inner_type).await {
-                return vec![create_type_completion(&nested_type)];
+            if let Some(nested_type) = analyzer.get_type_info(&inner_type) {
+                return vec![create_type_completion(nested_type)];
             }
         }
     }
@@ -388,7 +386,7 @@ fn extract_inner_type(type_string: &str) -> String {
 }
 
 /// Generate value completions based on field type
-async fn generate_value_completions_by_type(
+fn generate_value_completions_by_type(
     field_type: &str,
     analyzer: Arc<RustAnalyzer>,
 ) -> Vec<CompletionItem> {
@@ -398,7 +396,7 @@ async fn generate_value_completions_by_type(
     let clean_type = field_type.replace(" ", "");
 
     // First check if this is a custom type (struct or enum) in the workspace
-    if let Some(type_info) = analyzer.get_type_info(field_type).await {
+    if let Some(type_info) = analyzer.get_type_info(field_type) {
         match &type_info.kind {
             TypeKind::Enum(variants) => {
                 // For enums, provide completions for each variant
@@ -422,7 +420,7 @@ async fn generate_value_completions_by_type(
             }
             TypeKind::Struct(_) => {
                 // For structs, provide the type with snippet
-                completions.push(create_type_completion(&type_info));
+                completions.push(create_type_completion(type_info));
                 return completions;
             }
         }
@@ -431,7 +429,7 @@ async fn generate_value_completions_by_type(
     // Check for generic types and try to provide completions for the inner type
     if clean_type.starts_with("Option<") {
         let inner = extract_inner_type(&clean_type);
-        if let Some(type_info) = analyzer.get_type_info(&inner).await {
+        if let Some(type_info) = analyzer.get_type_info(&inner) {
             completions.push(CompletionItem {
                 label: format!(
                     "Some({})",
@@ -605,7 +603,7 @@ mod tests {
 
         let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
         let completions =
-            generate_completions_for_type(content, position, &type_info, analyzer).await;
+            generate_completions_for_type(content, position, &type_info, analyzer);
 
         // Should complete with variant fields
         assert!(!completions.is_empty());
@@ -663,7 +661,7 @@ mod tests {
 
         let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
         let completions =
-            generate_completions_for_type(content, position, &type_info, analyzer).await;
+            generate_completions_for_type(content, position, &type_info, analyzer);
 
         // Should complete with variant names
         assert!(!completions.is_empty());

@@ -8,23 +8,26 @@ description = "Create custom LSPs for ron configurations at compile time."
 
 [dependencies]
 anyhow = "1.0"
-tower-lsp = "0.20"
-tokio = { version = "1", features = ["full"] }
 ron = "0.12"
-tree-sitter = "0.25.10"
-ron-lsp-tree-sitter = { version = "0.1.0" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# For LSP server
+tower-lsp = { version = "0.20", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+
+# For RON parsing (used by LSP)
+tree-sitter = { version = "0.25.10", optional = true }
+ron-lsp-tree-sitter = { version = "0.1.0", optional = true }
 
 # For Rust type analysis
-syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
-quote = "1.0"
-proc-macro2 = { version = "1.0", features = ["span-locations"] }
-
-serde_json = "1.0"
-serde = "1.0"
+syn = { version = "2.0", features = ["full", "parsing", "extra-traits"], optional = true }
+quote = { version = "1.0", optional = true }
+proc-macro2 = { version = "1.0", features = ["span-locations"], optional = true }
 
 [features]
-# Analyze RON structs
-analyze = []
+# Analyze Rust source files for type extraction
+analyze = ["dep:syn", "dep:quote", "dep:proc-macro2"]
 
 # Serve LSP
-lsp = []
+lsp = ["dep:tower-lsp", "dep:tokio", "dep:tree-sitter", "dep:ron-lsp-tree-sitter"]
