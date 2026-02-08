@@ -1,10 +1,10 @@
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use syn::{Attribute, Fields, Item, ItemEnum, ItemStruct, ItemType, Type};
 use tokio::sync::RwLock;
-use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldInfo {
@@ -78,10 +78,9 @@ impl TypeInfo {
 }
 
 pub struct RustAnalyzer {
-    workspace_root: RwLock<Option<PathBuf>>,
+    root_type: RwLock<Option<String>>,
     type_cache: RwLock<HashMap<String, TypeInfo>>,
     type_aliases: RwLock<HashMap<String, String>>,
-    initial_scan_complete: RwLock<bool>,
 }
 
 impl serde::Serialize for RustAnalyzer {
@@ -91,6 +90,10 @@ impl serde::Serialize for RustAnalyzer {
     {
         use serde::ser::SerializeStruct;
 
+        let root_type = self
+            .root_type
+            .try_read()
+            .map_err(|_| serde::ser::Error::custom("failed to acquire root_type lock"))?;
         let type_cache = self
             .type_cache
             .try_read()
@@ -100,7 +103,8 @@ impl serde::Serialize for RustAnalyzer {
             .try_read()
             .map_err(|_| serde::ser::Error::custom("failed to acquire type_aliases lock"))?;
 
-        let mut state = serializer.serialize_struct("RustAnalyzer", 2)?;
+        let mut state = serializer.serialize_struct("RustAnalyzer", 3)?;
+        state.serialize_field("root_type", &*root_type)?;
         state.serialize_field("type_cache", &*type_cache)?;
         state.serialize_field("type_aliases", &*type_aliases)?;
         state.end()
@@ -118,6 +122,7 @@ impl<'de> serde::Deserialize<'de> for RustAnalyzer {
         #[derive(serde::Deserialize)]
         #[serde(field_identifier, rename_all = "snake_case")]
         enum Field {
+            RootType,
             TypeCache,
             TypeAliases,
         }
@@ -135,11 +140,18 @@ impl<'de> serde::Deserialize<'de> for RustAnalyzer {
             where
                 V: MapAccess<'de>,
             {
+                let mut root_type = None;
                 let mut type_cache = None;
                 let mut type_aliases = None;
 
                 while let Some(key) = map.next_key()? {
                     match key {
+                        Field::RootType => {
+                            if root_type.is_some() {
+                                return Err(de::Error::duplicate_field("root_type"));
+                            }
+                            root_type = Some(map.next_value()?);
+                        }
                         Field::TypeCache => {
                             if type_cache.is_some() {
                                 return Err(de::Error::duplicate_field("type_cache"));
@@ -155,21 +167,22 @@ impl<'de> serde::Deserialize<'de> for RustAnalyzer {
                     }
                 }
 
+                let root_type =
+                    root_type.ok_or_else(|| de::Error::missing_field("root_type"))?;
                 let type_cache =
                     type_cache.ok_or_else(|| de::Error::missing_field("type_cache"))?;
                 let type_aliases =
                     type_aliases.ok_or_else(|| de::Error::missing_field("type_aliases"))?;
 
                 Ok(RustAnalyzer {
-                    workspace_root: RwLock::new(None),
+                    root_type: RwLock::new(root_type),
                     type_cache: RwLock::new(type_cache),
                     type_aliases: RwLock::new(type_aliases),
-                    initial_scan_complete: RwLock::new(true),
                 })
             }
         }
 
-        const FIELDS: &[&str] = &["type_cache", "type_aliases"];
+        const FIELDS: &[&str] = &["root_type", "type_cache", "type_aliases"];
         deserializer.deserialize_struct("RustAnalyzer", FIELDS, RustAnalyzerVisitor)
     }
 }
@@ -177,51 +190,140 @@ impl<'de> serde::Deserialize<'de> for RustAnalyzer {
 impl RustAnalyzer {
     pub fn new() -> Self {
         Self {
-            workspace_root: RwLock::new(None),
+            root_type: RwLock::new(None),
             type_cache: RwLock::new(HashMap::new()),
             type_aliases: RwLock::new(HashMap::new()),
-            initial_scan_complete: RwLock::new(false),
         }
     }
 
-    pub async fn set_workspace_root(&self, root: &Path) {
-        *self.workspace_root.write().await = Some(root.to_path_buf());
-        // Trigger initial scan
-        self.scan_workspace().await;
-        // Mark initial scan as complete
-        *self.initial_scan_complete.write().await = true;
+    /// Set the root type path for this analyzer (e.g., "crate::models::Config")
+    pub async fn set_root_type(&self, type_path: &str) {
+        *self.root_type.write().await = Some(type_path.to_string());
     }
 
-    pub async fn scan_workspace(&self) {
-        let root = {
-            let guard = self.workspace_root.read().await;
-            match guard.as_ref() {
-                Some(r) => r.clone(),
-                None => return,
-            }
-        };
+    /// Get the root type path
+    pub async fn get_root_type(&self) -> Option<String> {
+        self.root_type.read().await.clone()
+    }
+
+    /// Get the TypeInfo for the root type
+    pub async fn get_root_type_info(&self) -> Option<TypeInfo> {
+        let root_type = self.get_root_type().await?;
+        self.get_type_info(&root_type).await
+    }
+
+    /// Add a Rust source file to the analyzer.
+    ///
+    /// Parses the file and extracts all type definitions (structs, enums, type aliases).
+    /// The module path is inferred from the file path (e.g., `src/models/user.rs` -> `crate::models::user`).
+    ///
+    /// # Arguments
+    /// * `file_path` - Path to the Rust source file
+    ///
+    /// # Returns
+    /// * `Ok(usize)` - Number of types extracted from the file
+    /// * `Err` - If the file cannot be read or parsed
+    pub async fn add_file(&self, file_path: &Path) -> Result<usize> {
+        let content = fs::read_to_string(file_path)
+            .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
+        self.add_source(file_path, &content).await
+    }
+
+    /// Add Rust source code to the analyzer with an associated file path.
+    ///
+    /// Parses the source and extracts all type definitions.
+    /// The module path is inferred from the file path.
+    ///
+    /// # Arguments
+    /// * `file_path` - Path to associate with this source (used for module path inference)
+    /// * `source` - Rust source code to parse
+    ///
+    /// # Returns
+    /// * `Ok(usize)` - Number of types extracted from the source
+    /// * `Err` - If the source cannot be parsed
+    pub async fn add_source(&self, file_path: &Path, source: &str) -> Result<usize> {
+        let syntax_tree = syn::parse_file(source)
+            .with_context(|| format!("Failed to parse Rust source from: {}", file_path.display()))?;
 
         let mut type_cache = self.type_cache.write().await;
         let mut type_aliases = self.type_aliases.write().await;
 
-        // Find all .rs files in the workspace
-        for entry in WalkDir::new(&root)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("rs"))
-        {
-            if let Ok(content) = fs::read_to_string(entry.path()) {
-                if let Ok(syntax_tree) = syn::parse_file(&content) {
-                    self.extract_types_from_file(
-                        &syntax_tree,
-                        entry.path(),
-                        &mut type_cache,
-                        &mut type_aliases,
-                    );
-                }
-            }
-        }
+        let initial_count = type_cache.len();
+        self.extract_types_from_file(&syntax_tree, file_path, &mut type_cache, &mut type_aliases);
+        let types_added = type_cache.len() - initial_count;
+
+        Ok(types_added)
+    }
+
+    /// Add Rust source code with a custom module prefix.
+    ///
+    /// Unlike `add_source`, this allows you to specify the module path directly
+    /// instead of inferring it from a file path.
+    ///
+    /// # Arguments
+    /// * `module_prefix` - The module path prefix (e.g., "crate::models")
+    /// * `source` - Rust source code to parse
+    ///
+    /// # Returns
+    /// * `Ok(usize)` - Number of types extracted from the source
+    /// * `Err` - If the source cannot be parsed
+    pub async fn add_source_with_prefix(
+        &self,
+        module_prefix: &str,
+        source: &str,
+    ) -> Result<usize> {
+        let syntax_tree = syn::parse_file(source)
+            .context("Failed to parse Rust source")?;
+
+        let mut type_cache = self.type_cache.write().await;
+        let mut type_aliases = self.type_aliases.write().await;
+
+        let initial_count = type_cache.len();
+        self.extract_types_from_syntax_tree(
+            &syntax_tree,
+            module_prefix,
+            None,
+            &mut type_cache,
+            &mut type_aliases,
+        );
+        let types_added = type_cache.len() - initial_count;
+
+        Ok(types_added)
+    }
+
+    /// Register a type directly with the analyzer.
+    ///
+    /// This is useful when you have pre-constructed TypeInfo objects.
+    pub async fn add_type(&self, type_info: TypeInfo) {
+        let mut cache = self.type_cache.write().await;
+        cache.insert(type_info.name.clone(), type_info);
+    }
+
+    /// Register a type alias.
+    ///
+    /// # Arguments
+    /// * `alias` - The alias name (e.g., "crate::MyAlias")
+    /// * `target` - The target type (e.g., "crate::SomeType")
+    pub async fn add_type_alias(&self, alias: &str, target: &str) {
+        let mut aliases = self.type_aliases.write().await;
+        aliases.insert(alias.to_string(), target.to_string());
+    }
+
+    /// Remove a type from the analyzer.
+    ///
+    /// # Returns
+    /// The removed TypeInfo if it existed
+    pub async fn remove_type(&self, type_path: &str) -> Option<TypeInfo> {
+        let mut cache = self.type_cache.write().await;
+        cache.remove(type_path)
+    }
+
+    /// Clear all types and aliases from the analyzer.
+    pub async fn clear(&self) {
+        let mut type_cache = self.type_cache.write().await;
+        let mut type_aliases = self.type_aliases.write().await;
+        type_cache.clear();
+        type_aliases.clear();
     }
 
     fn extract_types_from_file(
@@ -233,22 +335,38 @@ impl RustAnalyzer {
     ) {
         // Extract module path from file path
         let module_prefix = self.file_path_to_module_path(file_path);
+        self.extract_types_from_syntax_tree(
+            syntax_tree,
+            &module_prefix,
+            Some(file_path),
+            type_cache,
+            type_aliases,
+        );
+    }
 
+    fn extract_types_from_syntax_tree(
+        &self,
+        syntax_tree: &syn::File,
+        module_prefix: &str,
+        file_path: Option<&Path>,
+        type_cache: &mut HashMap<String, TypeInfo>,
+        type_aliases: &mut HashMap<String, String>,
+    ) {
         for item in &syntax_tree.items {
             if let Item::Struct(struct_item) = item {
                 if let Some(type_info) =
-                    self.extract_struct_info(struct_item, &module_prefix, file_path)
+                    self.extract_struct_info(struct_item, module_prefix, file_path)
                 {
                     type_cache.insert(type_info.name.clone(), type_info);
                 }
             } else if let Item::Enum(enum_item) = item {
                 if let Some(type_info) =
-                    self.extract_enum_info(enum_item, &module_prefix, file_path)
+                    self.extract_enum_info(enum_item, module_prefix, file_path)
                 {
                     type_cache.insert(type_info.name.clone(), type_info);
                 }
             } else if let Item::Type(type_item) = item {
-                self.extract_type_alias(type_item, &module_prefix, type_aliases);
+                self.extract_type_alias(type_item, module_prefix, type_aliases);
             } else if let Item::Mod(mod_item) = item {
                 // Handle inline modules
                 if let Some((_, items)) = &mod_item.content {
@@ -283,11 +401,7 @@ impl RustAnalyzer {
 
     /// Convert a file path to a module path
     ///
-    /// # Examples
-    /// ```
-    /// let module_path = self.file_file_path_to_module_path("src/models/user.rs");
-    /// assert_eq!(module_path, "crate::models::user");
-    /// ```
+    /// Example: `"src/models/user.rs"` -> `"crate::models::user"`
     fn file_path_to_module_path(&self, file_path: &Path) -> String {
         let components: Vec<_> = file_path
             .components()
@@ -333,7 +447,7 @@ impl RustAnalyzer {
         &self,
         struct_item: &ItemStruct,
         module_prefix: &str,
-        file_path: &Path,
+        file_path: Option<&Path>,
     ) -> Option<TypeInfo> {
         let struct_name = struct_item.ident.to_string();
         let full_path = if module_prefix.is_empty() {
@@ -406,7 +520,7 @@ impl RustAnalyzer {
             name: full_path,
             kind: TypeKind::Struct(fields),
             docs,
-            source_file: Some(file_path.to_path_buf()),
+            source_file: file_path.map(|p| p.to_path_buf()),
             line,
             column,
             has_default,
@@ -417,7 +531,7 @@ impl RustAnalyzer {
         &self,
         enum_item: &ItemEnum,
         module_prefix: &str,
-        file_path: &Path,
+        file_path: Option<&Path>,
     ) -> Option<TypeInfo> {
         let enum_name = enum_item.ident.to_string();
         let full_path = if module_prefix.is_empty() {
@@ -512,7 +626,7 @@ impl RustAnalyzer {
             name: full_path,
             kind: TypeKind::Enum(variants),
             docs,
-            source_file: Some(file_path.to_path_buf()),
+            source_file: file_path.map(|p| p.to_path_buf()),
             line,
             column,
             has_default,
@@ -547,66 +661,57 @@ impl RustAnalyzer {
                 .unwrap_or_else(|| type_path.to_string())
         };
 
-        // First check cache with exact match
-        {
-            let cache = self.type_cache.read().await;
-            if let Some(info) = cache.get(&resolved_type) {
-                return Some(info.clone());
-            }
-            // Also try the original type path
-            if let Some(info) = cache.get(type_path) {
-                return Some(info.clone());
-            }
+        // Check cache with exact match
+        let cache = self.type_cache.read().await;
+        if let Some(info) = cache.get(&resolved_type) {
+            return Some(info.clone());
+        }
+        // Also try the original type path
+        if let Some(info) = cache.get(type_path) {
+            return Some(info.clone());
+        }
 
-            // If not found by exact match, try finding by simple name
-            // e.g., "PostType" should match "crate::models::PostType"
-            // After resolving alias, also try simple name match for resolved_type
-            for (key, value) in cache.iter() {
-                if key.ends_with(&format!("::{}", type_path))
-                    || key.ends_with(&format!("::{}", resolved_type))
-                    || key == type_path
-                    || key == &resolved_type
-                {
-                    return Some(value.clone());
-                }
+        // If not found by exact match, try finding by simple name
+        // e.g., "PostType" should match "crate::models::PostType"
+        for (key, value) in cache.iter() {
+            if key.ends_with(&format!("::{}", type_path))
+                || key.ends_with(&format!("::{}", resolved_type))
+                || key == type_path
+                || key == &resolved_type
+            {
+                return Some(value.clone());
             }
         }
 
-        // If not in cache and initial scan hasn't completed, rescan
-        let scan_complete = *self.initial_scan_complete.read().await;
-        if !scan_complete {
-            self.scan_workspace().await;
-
-            let cache = self.type_cache.read().await;
-            return cache
-                .get(&resolved_type)
-                .cloned()
-                .or_else(|| cache.get(type_path).cloned())
-                .or_else(|| {
-                    // Try simple name match after rescan
-                    for (key, value) in cache.iter() {
-                        if key.ends_with(&format!("::{}", type_path)) || key == type_path {
-                            return Some(value.clone());
-                        }
-                    }
-                    None
-                });
-        }
-
-        // Initial scan already complete, type not found
         None
     }
 
-    /// Get all types from the workspace
+    /// Get all types registered with the analyzer
     pub async fn get_all_types(&self) -> Vec<TypeInfo> {
         let cache = self.type_cache.read().await;
         cache.values().cloned().collect()
     }
 
+    /// Get the number of types registered with the analyzer
+    pub async fn type_count(&self) -> usize {
+        let cache = self.type_cache.read().await;
+        cache.len()
+    }
+
+    /// Check if a type exists in the analyzer
+    pub async fn has_type(&self, type_path: &str) -> bool {
+        self.get_type_info(type_path).await.is_some()
+    }
+
     #[cfg(test)]
     pub async fn insert_type_for_test(&self, type_info: TypeInfo) {
-        let mut cache = self.type_cache.write().await;
-        cache.insert(type_info.name.clone(), type_info);
+        self.add_type(type_info).await;
+    }
+}
+
+impl Default for RustAnalyzer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -700,12 +805,14 @@ mod serde_attributes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[tokio::test]
     async fn test_rust_analyzer_serialization_roundtrip() {
         let analyzer = RustAnalyzer::new();
+        analyzer.set_root_type("crate::Test").await;
         analyzer
-            .insert_type_for_test(TypeInfo {
+            .add_type(TypeInfo {
                 name: "Test".to_string(),
                 kind: TypeKind::Struct(vec![]),
                 docs: None,
@@ -720,5 +827,208 @@ mod tests {
         let deserialized: RustAnalyzer = serde_json::from_str(&json).unwrap();
 
         assert!(deserialized.get_type_info("Test").await.is_some());
+        assert_eq!(
+            deserialized.get_root_type().await,
+            Some("crate::Test".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_source_with_prefix() {
+        let analyzer = RustAnalyzer::new();
+
+        let source = r#"
+            /// A user in the system
+            pub struct User {
+                /// The user's unique ID
+                pub id: u64,
+                pub name: String,
+            }
+
+            pub enum Status {
+                Active,
+                Inactive,
+            }
+        "#;
+
+        let count = analyzer
+            .add_source_with_prefix("crate::models", source)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 2, "Should extract 2 types (User and Status)");
+
+        let user = analyzer.get_type_info("crate::models::User").await;
+        assert!(user.is_some(), "User type should exist");
+
+        let user = user.unwrap();
+        assert_eq!(user.docs, Some("A user in the system".to_string()));
+        assert!(matches!(user.kind, TypeKind::Struct(_)));
+
+        if let TypeKind::Struct(fields) = &user.kind {
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].name, "id");
+            assert_eq!(fields[0].docs, Some("The user's unique ID".to_string()));
+        }
+
+        let status = analyzer.get_type_info("crate::models::Status").await;
+        assert!(status.is_some(), "Status type should exist");
+    }
+
+    #[tokio::test]
+    async fn test_add_source_with_file_path() {
+        let analyzer = RustAnalyzer::new();
+
+        let source = r#"
+            pub struct Config {
+                pub debug: bool,
+            }
+        "#;
+
+        let file_path = PathBuf::from("src/settings/config.rs");
+        let count = analyzer.add_source(&file_path, source).await.unwrap();
+
+        assert_eq!(count, 1);
+
+        // Should be accessible via the inferred module path
+        let config = analyzer
+            .get_type_info("crate::settings::config::Config")
+            .await;
+        assert!(config.is_some(), "Config should be at inferred path");
+    }
+
+    #[tokio::test]
+    async fn test_add_type_directly() {
+        let analyzer = RustAnalyzer::new();
+
+        let type_info = TypeInfo {
+            name: "crate::MyType".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "value".to_string(),
+                type_name: "i32".to_string(),
+                docs: Some("The value".to_string()),
+                line: None,
+                column: None,
+                has_default: false,
+            }]),
+            docs: Some("My custom type".to_string()),
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+
+        analyzer.add_type(type_info).await;
+
+        assert!(analyzer.has_type("crate::MyType").await);
+        assert_eq!(analyzer.type_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_remove_type() {
+        let analyzer = RustAnalyzer::new();
+
+        analyzer
+            .add_type(TypeInfo {
+                name: "crate::ToRemove".to_string(),
+                kind: TypeKind::Struct(vec![]),
+                docs: None,
+                source_file: None,
+                line: None,
+                column: None,
+                has_default: false,
+            })
+            .await;
+
+        assert!(analyzer.has_type("crate::ToRemove").await);
+
+        let removed = analyzer.remove_type("crate::ToRemove").await;
+        assert!(removed.is_some());
+        assert!(!analyzer.has_type("crate::ToRemove").await);
+    }
+
+    #[tokio::test]
+    async fn test_clear() {
+        let analyzer = RustAnalyzer::new();
+
+        analyzer
+            .add_source_with_prefix("crate", "pub struct A {} pub struct B {}")
+            .await
+            .unwrap();
+
+        assert_eq!(analyzer.type_count().await, 2);
+
+        analyzer.clear().await;
+
+        assert_eq!(analyzer.type_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_type_alias() {
+        let analyzer = RustAnalyzer::new();
+
+        analyzer
+            .add_type(TypeInfo {
+                name: "crate::RealType".to_string(),
+                kind: TypeKind::Struct(vec![]),
+                docs: Some("The real type".to_string()),
+                source_file: None,
+                line: None,
+                column: None,
+                has_default: false,
+            })
+            .await;
+
+        analyzer
+            .add_type_alias("crate::AliasType", "crate::RealType")
+            .await;
+
+        // Looking up the alias should return the real type
+        let via_alias = analyzer.get_type_info("crate::AliasType").await;
+        assert!(via_alias.is_some());
+        assert_eq!(via_alias.unwrap().name, "crate::RealType");
+    }
+
+    #[tokio::test]
+    async fn test_inline_module() {
+        let analyzer = RustAnalyzer::new();
+
+        let source = r#"
+            pub mod inner {
+                pub struct InnerType {
+                    pub x: i32,
+                }
+            }
+        "#;
+
+        analyzer
+            .add_source_with_prefix("crate", source)
+            .await
+            .unwrap();
+
+        let inner_type = analyzer.get_type_info("crate::inner::InnerType").await;
+        assert!(inner_type.is_some(), "InnerType should be found");
+    }
+
+    #[tokio::test]
+    async fn test_simple_name_lookup() {
+        let analyzer = RustAnalyzer::new();
+
+        analyzer
+            .add_type(TypeInfo {
+                name: "crate::deeply::nested::MyStruct".to_string(),
+                kind: TypeKind::Struct(vec![]),
+                docs: None,
+                source_file: None,
+                line: None,
+                column: None,
+                has_default: false,
+            })
+            .await;
+
+        // Should be able to find by simple name
+        let found = analyzer.get_type_info("MyStruct").await;
+        assert!(found.is_some(), "Should find by simple name");
+        assert_eq!(found.unwrap().name, "crate::deeply::nested::MyStruct");
     }
 }

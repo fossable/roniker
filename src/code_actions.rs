@@ -640,13 +640,30 @@ fn generate_field_insertions(missing_fields: &[&FieldInfo], content: &str) -> Op
 /// This primarily looks for EnumName::VariantName( pattern
 /// Returns None for regular structs without :: prefix
 fn detect_current_variant_in_content(content: &str) -> Option<String> {
-    // First try regex for :: syntax (which indicates it's definitely a variant)
-    let re = regex::Regex::new(r"\w+::(\w+)\s*[\(\{]").ok()?;
-    if let Some(caps) = re.captures(content) {
-        return Some(caps.get(1)?.as_str().to_string());
+    // Look for :: pattern which indicates it's definitely a variant
+    let double_colon_idx = content.find("::")?;
+
+    // Find the variant name after ::
+    let after_colons = &content[double_colon_idx + 2..];
+    let variant_start = after_colons.chars().position(|c| c.is_alphanumeric() || c == '_')?;
+    let variant_part = &after_colons[variant_start..];
+
+    // Extract the variant name (alphanumeric + underscore until opening paren/brace or whitespace)
+    let variant_end = variant_part
+        .chars()
+        .position(|c| !c.is_alphanumeric() && c != '_')
+        .unwrap_or(variant_part.len());
+
+    let variant_name = &variant_part[..variant_end];
+
+    // Check that there's an opening paren or brace after the variant name (with optional whitespace)
+    let remaining = variant_part[variant_end..].trim_start();
+    if remaining.starts_with('(') || remaining.starts_with('{') {
+        if !variant_name.is_empty() {
+            return Some(variant_name.to_string());
+        }
     }
 
-    // If no :: found, don't assume it's a variant (could be a regular struct)
     None
 }
 
@@ -964,9 +981,7 @@ mod tests {
 
         // Create mock analyzer and client for the test
         use crate::rust_analyzer::RustAnalyzer;
-        use std::path::PathBuf;
         use std::sync::Arc;
-        use tower_lsp::Client;
 
         let analyzer = Arc::new(RustAnalyzer::new());
         let (service, _) = tower_lsp::LspService::new(|client| crate::Backend {

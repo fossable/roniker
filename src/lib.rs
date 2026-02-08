@@ -1,4 +1,3 @@
-mod annotation_parser;
 mod code_actions;
 mod completion;
 mod diagnostic_reporter;
@@ -11,7 +10,7 @@ mod ts_utils;
 pub use rust_analyzer::RustAnalyzer;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
@@ -21,7 +20,6 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 #[derive(Debug)]
 pub struct Document {
     content: String,
-    type_annotation: Option<String>,
     // Cache context lookups - map from (line, character) to type contexts
     // We use a simple cache that stores recent lookups
     context_cache: std::collections::HashMap<(u32, u32), Vec<tree_sitter_parser::TypeContext>>,
@@ -34,17 +32,12 @@ pub struct Backend {
 }
 
 impl Backend {
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: Client, analyzer: RustAnalyzer) -> Self {
         Self {
             client,
             documents: Arc::new(RwLock::new(HashMap::new())),
-            rust_analyzer: Arc::new(rust_analyzer::RustAnalyzer::new()),
+            rust_analyzer: Arc::new(analyzer),
         }
-    }
-
-    // TODO remove
-    async fn get_type_annotation(&self, content: &str, uri: &Url) -> Option<String> {
-        None
     }
 
     /// Get type contexts with caching
@@ -84,41 +77,30 @@ impl Backend {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        // Get workspace root
-        let root = if let Some(workspace_folders) = &params.workspace_folders {
+        // Log workspace info (types are now added via add_file/add_source methods)
+        if let Some(workspace_folders) = &params.workspace_folders {
             if let Some(folder) = workspace_folders.first() {
-                Some(folder.uri.to_file_path().unwrap())
-            } else {
-                None
-            }
-        } else if let Some(root_uri) = &params.root_uri {
-            Some(root_uri.to_file_path().unwrap())
-        } else {
-            None
-        };
-
-        if let Some(root) = root {
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!("Setting workspace root to: {:?}", root),
-                )
-                .await;
-            self.rust_analyzer.set_workspace_root(&root).await;
-
-            // Log what types were found
-            let types = self.rust_analyzer.get_all_types().await;
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!("Found {} types in workspace", types.len()),
-                )
-                .await;
-            for type_info in types.iter().take(10) {
                 self.client
-                    .log_message(MessageType::INFO, format!("  - {}", type_info.name))
+                    .log_message(
+                        MessageType::INFO,
+                        format!("Workspace root: {:?}", folder.uri.to_file_path().unwrap()),
+                    )
                     .await;
             }
+        }
+
+        // Log registered types
+        let types = self.rust_analyzer.get_all_types().await;
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("Registered {} types", types.len()),
+            )
+            .await;
+        for type_info in types.iter().take(10) {
+            self.client
+                .log_message(MessageType::INFO, format!("  - {}", type_info.name))
+                .await;
         }
 
         Ok(InitializeResult {
@@ -158,45 +140,35 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let content = params.text_document.text;
-        let type_annotation = self
-            .get_type_annotation(&content, &params.text_document.uri)
-            .await;
         let uri = params.text_document.uri.to_string();
 
         self.documents.write().await.insert(
             uri.clone(),
             Document {
                 content: content.clone(),
-                type_annotation: type_annotation.clone(),
                 context_cache: std::collections::HashMap::new(),
             },
         );
 
-        // Publish diagnostics
-        self.publish_diagnostics(&uri, &content, type_annotation.as_deref())
-            .await;
+        // Publish diagnostics using root type from rust_analyzer
+        self.publish_diagnostics(&uri, &content).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         if let Some(change) = params.content_changes.into_iter().next() {
             let content = change.text;
-            let type_annotation = self
-                .get_type_annotation(&content, &params.text_document.uri)
-                .await;
             let uri = params.text_document.uri.to_string();
 
             self.documents.write().await.insert(
                 uri.clone(),
                 Document {
                     content: content.clone(),
-                    type_annotation: type_annotation.clone(),
                     context_cache: std::collections::HashMap::new(),
                 },
             );
 
-            // Publish diagnostics
-            self.publish_diagnostics(&uri, &content, type_annotation.as_deref())
-                .await;
+            // Publish diagnostics using root type from rust_analyzer
+            self.publish_diagnostics(&uri, &content).await;
         }
     }
 
@@ -220,14 +192,17 @@ impl LanguageServer for Backend {
             .to_string();
         let position = params.text_document_position_params.position;
 
-        // Get document data we need (clone to avoid holding lock during async operations)
-        let (content, type_path) = {
+        // Get document content
+        let content = {
             let documents = self.documents.read().await;
             match documents.get(&uri) {
-                Some(doc) => (doc.content.clone(), doc.type_annotation.clone()),
+                Some(doc) => doc.content.clone(),
                 None => return Ok(None),
             }
         };
+
+        // Get root type from rust_analyzer
+        let type_path = self.rust_analyzer.get_root_type().await;
 
         // Get the word at cursor position - early return if none
         let word = match get_word_at_position(&content, position) {
@@ -483,14 +458,17 @@ impl LanguageServer for Backend {
             .to_string();
         let position = params.text_document_position_params.position;
 
-        // Get document data we need (clone to avoid holding lock during async operations)
-        let (content, type_path) = {
+        // Get document content
+        let content = {
             let documents = self.documents.read().await;
             match documents.get(&uri) {
-                Some(doc) => (doc.content.clone(), doc.type_annotation.clone()),
+                Some(doc) => doc.content.clone(),
                 None => return Ok(None),
             }
         };
+
+        // Get root type from rust_analyzer
+        let type_path = self.rust_analyzer.get_root_type().await;
 
         // Get the word at cursor position
         let word = match get_word_at_position(&content, position) {
@@ -671,13 +649,17 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri.to_string();
         let position = params.text_document_position.position;
 
-        let (content, type_path) = {
+        // Get document content
+        let content = {
             let documents = self.documents.read().await;
             match documents.get(&uri) {
-                Some(doc) => (doc.content.clone(), doc.type_annotation.clone()),
+                Some(doc) => doc.content.clone(),
                 None => return Ok(None),
             }
         };
+
+        // Get root type from rust_analyzer
+        let type_path = self.rust_analyzer.get_root_type().await;
 
         if let Some(type_path) = type_path {
             // Get type contexts
@@ -711,10 +693,11 @@ impl LanguageServer for Backend {
             )
             .await;
 
-        let (content, type_path) = {
+        // Get document content
+        let content = {
             let documents = self.documents.read().await;
             match documents.get(&uri) {
-                Some(doc) => (doc.content.clone(), doc.type_annotation.clone()),
+                Some(doc) => doc.content.clone(),
                 None => {
                     self.client
                         .log_message(MessageType::INFO, "No document found")
@@ -724,9 +707,12 @@ impl LanguageServer for Backend {
             }
         };
 
+        // Get root type from rust_analyzer
+        let type_path = self.rust_analyzer.get_root_type().await;
+
         if let Some(type_path) = type_path {
             self.client
-                .log_message(MessageType::INFO, format!("Type annotation: {}", type_path))
+                .log_message(MessageType::INFO, format!("Root type: {}", type_path))
                 .await;
             if let Some(type_info) = self.rust_analyzer.get_type_info(&type_path).await {
                 self.client
@@ -1113,19 +1099,22 @@ impl Backend {
         hover_text
     }
 
-    async fn publish_diagnostics(&self, uri: &str, content: &str, type_annotation: Option<&str>) {
+    async fn publish_diagnostics(&self, uri: &str, content: &str) {
+        // Get root type from rust_analyzer
+        let type_path = self.rust_analyzer.get_root_type().await;
+
         self.client
             .log_message(
                 MessageType::INFO,
                 format!(
-                    "Publishing diagnostics for {} with type annotation: {:?}",
-                    uri, type_annotation
+                    "Publishing diagnostics for {} with root type: {:?}",
+                    uri, type_path
                 ),
             )
             .await;
 
-        let diagnostics = if let Some(type_path) = type_annotation {
-            if let Some(type_info) = self.rust_analyzer.get_type_info(type_path).await {
+        let diagnostics = if let Some(type_path) = type_path {
+            if let Some(type_info) = self.rust_analyzer.get_type_info(&type_path).await {
                 self.client
                     .log_message(
                         MessageType::INFO,
@@ -1161,7 +1150,7 @@ impl Backend {
             }
         } else {
             self.client
-                .log_message(MessageType::INFO, "No type annotation found")
+                .log_message(MessageType::INFO, "No root type set")
                 .await;
             vec![]
         };
@@ -1181,6 +1170,454 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rust_analyzer::{FieldInfo, TypeInfo, TypeKind};
+
+    /// Helper to create a test Backend with a mock LSP client
+    async fn create_test_backend() -> Backend {
+        let (service, _) = LspService::new(|client| Backend::new(client, RustAnalyzer::new()));
+        service.inner().clone()
+    }
+
+    impl Clone for Backend {
+        fn clone(&self) -> Self {
+            Backend {
+                client: self.client.clone(),
+                documents: self.documents.clone(),
+                rust_analyzer: self.rust_analyzer.clone(),
+            }
+        }
+    }
+
+    /// Test that hover returns documentation for struct fields
+    #[tokio::test]
+    async fn test_lsp_hover_on_struct_field() {
+        let backend = create_test_backend().await;
+
+        // Set up a type with documented fields
+        let user_type = TypeInfo {
+            name: "crate::User".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "id".to_string(),
+                    type_name: "u64".to_string(),
+                    docs: Some("The unique user identifier".to_string()),
+                    line: Some(10),
+                    column: Some(4),
+                    has_default: false,
+                },
+                FieldInfo {
+                    name: "name".to_string(),
+                    type_name: "String".to_string(),
+                    docs: Some("The user's display name".to_string()),
+                    line: Some(12),
+                    column: Some(4),
+                    has_default: false,
+                },
+                FieldInfo {
+                    name: "email".to_string(),
+                    type_name: "String".to_string(),
+                    docs: None,
+                    line: Some(14),
+                    column: Some(4),
+                    has_default: false,
+                },
+            ]),
+            docs: Some("A user in the system".to_string()),
+            source_file: None,
+            line: Some(8),
+            column: Some(0),
+            has_default: false,
+        };
+
+        backend.rust_analyzer.insert_type_for_test(user_type).await;
+        backend.rust_analyzer.set_root_type("crate::User").await;
+
+        // Simulate opening a document
+        let uri: Url = "file:///test/user.ron".parse().unwrap();
+        let content = r#"User(
+    id: 42,
+    name: "Alice",
+    email: "alice@example.com",
+)"#;
+
+        backend.documents.write().await.insert(
+            uri.to_string(),
+            Document {
+                content: content.to_string(),
+                context_cache: std::collections::HashMap::new(),
+            },
+        );
+
+        // Test hover on "id" field (line 1, character 4)
+        let hover_params = HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(1, 6), // On "id"
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+
+        let hover_result = backend.hover(hover_params).await.unwrap();
+        assert!(
+            hover_result.is_some(),
+            "Hover should return a result for 'id' field"
+        );
+
+        let hover = hover_result.unwrap();
+        if let HoverContents::Markup(markup) = hover.contents {
+            assert!(
+                markup.value.contains("id"),
+                "Hover should contain field name. Got: {}",
+                markup.value
+            );
+            assert!(
+                markup.value.contains("u64"),
+                "Hover should contain type. Got: {}",
+                markup.value
+            );
+            assert!(
+                markup.value.contains("unique user identifier"),
+                "Hover should contain documentation. Got: {}",
+                markup.value
+            );
+        } else {
+            panic!("Expected Markup hover contents");
+        }
+
+        // Test hover on "name" field (line 2, character 4)
+        let hover_params = HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(2, 6), // On "name"
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+
+        let hover_result = backend.hover(hover_params).await.unwrap();
+        assert!(
+            hover_result.is_some(),
+            "Hover should return a result for 'name' field"
+        );
+
+        let hover = hover_result.unwrap();
+        if let HoverContents::Markup(markup) = hover.contents {
+            assert!(
+                markup.value.contains("name"),
+                "Hover should contain field name"
+            );
+            assert!(markup.value.contains("String"), "Hover should contain type");
+            assert!(
+                markup.value.contains("display name"),
+                "Hover should contain documentation"
+            );
+        } else {
+            panic!("Expected Markup hover contents");
+        }
+    }
+
+    /// Test that hover returns documentation for enum variants
+    #[tokio::test]
+    async fn test_lsp_hover_on_enum_variant() {
+        use crate::rust_analyzer::EnumVariant;
+
+        let backend = create_test_backend().await;
+
+        // Set up an enum type
+        let status_type = TypeInfo {
+            name: "crate::Status".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Active".to_string(),
+                    fields: vec![],
+                    docs: Some("The user is currently active".to_string()),
+                    line: Some(5),
+                    column: Some(4),
+                },
+                EnumVariant {
+                    name: "Inactive".to_string(),
+                    fields: vec![FieldInfo {
+                        name: "reason".to_string(),
+                        type_name: "String".to_string(),
+                        docs: Some("Why the user is inactive".to_string()),
+                        line: Some(8),
+                        column: Some(8),
+                        has_default: false,
+                    }],
+                    docs: Some("The user is not active".to_string()),
+                    line: Some(7),
+                    column: Some(4),
+                },
+            ]),
+            docs: Some("User account status".to_string()),
+            source_file: None,
+            line: Some(3),
+            column: Some(0),
+            has_default: false,
+        };
+
+        backend
+            .rust_analyzer
+            .insert_type_for_test(status_type)
+            .await;
+        backend.rust_analyzer.set_root_type("crate::Status").await;
+
+        // Simulate opening a document with an enum variant
+        let uri: Url = "file:///test/status.ron".parse().unwrap();
+        let content = r#"Inactive(
+    reason: "On vacation",
+)"#;
+
+        backend.documents.write().await.insert(
+            uri.to_string(),
+            Document {
+                content: content.to_string(),
+                context_cache: std::collections::HashMap::new(),
+            },
+        );
+
+        // Test hover on "Inactive" variant (line 0, character 2)
+        let hover_params = HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(0, 2), // On "Inactive"
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+
+        let hover_result = backend.hover(hover_params).await.unwrap();
+        assert!(
+            hover_result.is_some(),
+            "Hover should return a result for 'Inactive' variant"
+        );
+
+        let hover = hover_result.unwrap();
+        if let HoverContents::Markup(markup) = hover.contents {
+            assert!(
+                markup.value.contains("Inactive"),
+                "Hover should contain variant name. Got: {}",
+                markup.value
+            );
+            assert!(
+                markup.value.contains("not active"),
+                "Hover should contain variant documentation. Got: {}",
+                markup.value
+            );
+        } else {
+            panic!("Expected Markup hover contents");
+        }
+    }
+
+    /// Test that hover works on the type name itself
+    #[tokio::test]
+    async fn test_lsp_hover_on_type_name() {
+        let backend = create_test_backend().await;
+
+        // Set up a simple type
+        let config_type = TypeInfo {
+            name: "crate::Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "debug".to_string(),
+                type_name: "bool".to_string(),
+                docs: Some("Enable debug mode".to_string()),
+                line: Some(5),
+                column: Some(4),
+                has_default: false,
+            }]),
+            docs: Some("Application configuration settings".to_string()),
+            source_file: None,
+            line: Some(3),
+            column: Some(0),
+            has_default: false,
+        };
+
+        backend
+            .rust_analyzer
+            .insert_type_for_test(config_type)
+            .await;
+        backend.rust_analyzer.set_root_type("crate::Config").await;
+
+        let uri: Url = "file:///test/config.ron".parse().unwrap();
+        let content = r#"Config(
+    debug: true,
+)"#;
+
+        backend.documents.write().await.insert(
+            uri.to_string(),
+            Document {
+                content: content.to_string(),
+                context_cache: std::collections::HashMap::new(),
+            },
+        );
+
+        // Test hover on "Config" type name (line 0, character 2)
+        let hover_params = HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(0, 2), // On "Config"
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+
+        let hover_result = backend.hover(hover_params).await.unwrap();
+        assert!(
+            hover_result.is_some(),
+            "Hover should return a result for type name"
+        );
+
+        let hover = hover_result.unwrap();
+        if let HoverContents::Markup(markup) = hover.contents {
+            assert!(
+                markup.value.contains("Config"),
+                "Hover should contain type name. Got: {}",
+                markup.value
+            );
+            assert!(
+                markup.value.contains("struct"),
+                "Hover should indicate it's a struct. Got: {}",
+                markup.value
+            );
+            assert!(
+                markup.value.contains("configuration settings"),
+                "Hover should contain type documentation. Got: {}",
+                markup.value
+            );
+        } else {
+            panic!("Expected Markup hover contents");
+        }
+    }
+
+    /// Test that hover returns None for positions with no meaningful content
+    #[tokio::test]
+    async fn test_lsp_hover_on_whitespace() {
+        let backend = create_test_backend().await;
+
+        let simple_type = TypeInfo {
+            name: "crate::Simple".to_string(),
+            kind: TypeKind::Struct(vec![]),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+
+        backend
+            .rust_analyzer
+            .insert_type_for_test(simple_type)
+            .await;
+        backend.rust_analyzer.set_root_type("crate::Simple").await;
+
+        let uri: Url = "file:///test/simple.ron".parse().unwrap();
+        let content = r#"Simple(
+
+)"#;
+
+        backend.documents.write().await.insert(
+            uri.to_string(),
+            Document {
+                content: content.to_string(),
+                context_cache: std::collections::HashMap::new(),
+            },
+        );
+
+        // Test hover on empty line (line 1, which is just whitespace)
+        let hover_params = HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position::new(1, 0), // Empty line
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+
+        let hover_result = backend.hover(hover_params).await.unwrap();
+        assert!(
+            hover_result.is_none(),
+            "Hover on whitespace should return None"
+        );
+    }
+
+    /// Test completion returns field suggestions
+    #[tokio::test]
+    async fn test_lsp_completion_suggests_fields() {
+        let backend = create_test_backend().await;
+
+        let user_type = TypeInfo {
+            name: "crate::User".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "id".to_string(),
+                    type_name: "u64".to_string(),
+                    docs: Some("User ID".to_string()),
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+                FieldInfo {
+                    name: "name".to_string(),
+                    type_name: "String".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+            ]),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+
+        backend.rust_analyzer.insert_type_for_test(user_type).await;
+        backend.rust_analyzer.set_root_type("crate::User").await;
+
+        let uri: Url = "file:///test/user.ron".parse().unwrap();
+        // Content with cursor position where we want completions
+        let content = r#"User(
+
+)"#;
+
+        backend.documents.write().await.insert(
+            uri.to_string(),
+            Document {
+                content: content.to_string(),
+                context_cache: std::collections::HashMap::new(),
+            },
+        );
+
+        // Request completion inside the struct
+        let completion_params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position::new(1, 4), // Inside struct, empty line
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+            context: None,
+        };
+
+        let completion_result = backend.completion(completion_params).await.unwrap();
+        assert!(
+            completion_result.is_some(),
+            "Completion should return suggestions"
+        );
+
+        if let Some(CompletionResponse::Array(items)) = completion_result {
+            let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+            assert!(
+                labels.contains(&"id"),
+                "Completion should suggest 'id' field. Got: {:?}",
+                labels
+            );
+            assert!(
+                labels.contains(&"name"),
+                "Completion should suggest 'name' field. Got: {:?}",
+                labels
+            );
+        } else {
+            panic!("Expected Array completion response");
+        }
+    }
 
     #[test]
     fn test_format_ron_named_struct() {
@@ -1212,7 +1649,9 @@ mod tests {
     }
 
     #[test]
-    fn test_format_ron_with_annotation() {
+    fn test_format_ron_with_comment() {
+        // Type annotations are no longer special - they're just regular comments
+        // that get stripped during formatting
         let input = r#"/* @[crate::models::User] */
 
 User(
@@ -1221,22 +1660,12 @@ User(
 )"#;
         let formatted = Backend::format_ron(input);
 
-        // Should preserve annotation
-        assert!(
-            formatted.contains("/* @[crate::models::User] */"),
-            "Should preserve type annotation. Got: {}",
-            formatted
-        );
-
-        // Extract RON part (after annotation)
-        let ron_part = formatted.split("*/").nth(1).unwrap().trim();
-
         // Should be parseable
-        let parsed = ron::from_str::<ron::Value>(ron_part);
+        let parsed = ron::from_str::<ron::Value>(&formatted);
         assert!(
             parsed.is_ok(),
-            "Formatted RON (without annotation) should be parseable. Got: {}\nError: {:?}",
-            ron_part,
+            "Formatted RON should be parseable. Got: {}\nError: {:?}",
+            formatted,
             parsed.as_ref().err()
         );
     }
@@ -1272,10 +1701,8 @@ User(
 
     #[test]
     fn test_format_ron_real_example() {
-        // This is actual RON syntax from user.ron
-        let input = r#"/* @[crate::models::User] */
-
-User(
+        // This is actual RON syntax from user.ron (without the old type annotation comment)
+        let input = r#"User(
     id: 1,
     name: "Alice Johnson",
     email: "alice@example.com",
@@ -1287,26 +1714,15 @@ User(
 
         let formatted = Backend::format_ron(input);
 
-        // Should preserve annotation
-        assert!(
-            formatted.contains("/* @[crate::models::User] */"),
-            "Should preserve type annotation"
-        );
-
-        // Extract RON part (after annotation)
-        let ron_part = formatted.split("*/").nth(1).unwrap().trim();
-        let original_ron_part = input.split("*/").nth(1).unwrap().trim();
-
         // Both should parse
-        let original_parsed: ron::Value =
-            ron::from_str(original_ron_part).expect("Original should parse");
-        let formatted_parsed = ron::from_str::<ron::Value>(ron_part);
+        let original_parsed: ron::Value = ron::from_str(input).expect("Original should parse");
+        let formatted_parsed = ron::from_str::<ron::Value>(&formatted);
 
         assert!(
             formatted_parsed.is_ok(),
             "Formatted RON should be parseable.\n\nOriginal RON:\n{}\n\nFormatted RON:\n{}\n\nError: {:?}",
-            original_ron_part,
-            ron_part,
+            input,
+            formatted,
             formatted_parsed.as_ref().err()
         );
 
@@ -1320,10 +1736,8 @@ User(
 
     #[test]
     fn test_format_ron_outputs_valid_ron() {
-        // Test with simpler content without inline comments (comment preservation is a TODO)
-        let input = r#"/* @[crate::models::Post] */
-
-Post(
+        // Test complex nested RON
+        let input = r#"Post(
     id: 123,
     title: "Mixed Syntax Example",
     content: "Demonstrating both explicit and unnamed struct syntax",
@@ -1348,27 +1762,20 @@ Post(
         println!("{}", formatted);
         println!("===== END =====");
 
-        // Extract RON part
-        let ron_part = if formatted.contains("*/") {
-            formatted.split("*/").nth(1).unwrap().trim()
-        } else {
-            formatted.trim()
-        };
-
         // The formatted output MUST be valid RON
-        let parse_result = ron::from_str::<ron::Value>(ron_part);
+        let parse_result = ron::from_str::<ron::Value>(&formatted);
         assert!(
             parse_result.is_ok(),
             "Formatted output must be valid RON.\n\nFormatted:\n{}\n\nError: {:?}",
-            ron_part,
+            formatted,
             parse_result.err()
         );
 
         // And it should NOT look like JSON (no leading braces for maps)
         assert!(
-            !ron_part.trim().starts_with('{'),
+            !formatted.trim().starts_with('{'),
             "Formatted RON should not start with '{{' (that's JSON syntax). Got:\n{}",
-            ron_part
+            formatted
         );
     }
 
@@ -1486,11 +1893,11 @@ PostReference(
     }
 }
 
-pub async fn serve() {
-    // Run as LSP server
+/// Run the LSP server on stdin/stdout for the given analyzer.
+pub async fn serve(analyzer: RustAnalyzer) {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(Backend::new);
+    let (service, socket) = LspService::new(|client| Backend::new(client, analyzer));
     Server::new(stdin, stdout, socket).serve(service).await;
 }

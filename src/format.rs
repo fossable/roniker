@@ -1,9 +1,6 @@
 /// Tree-sitter based RON formatter
 /// This formatter uses the AST to properly handle formatting
-use crate::{
-    annotation_parser,
-    ts_utils::{self, RonParser},
-};
+use crate::ts_utils::{self, RonParser};
 use tree_sitter::Node;
 
 /// Format RON content using tree-sitter AST
@@ -13,17 +10,9 @@ pub fn format_ron(content: &str) -> String {
     // Build the formatted output
     let mut result = String::new();
 
-    // Check for type annotation using the existing parser
-    // (tree-sitter grammar has issues with /* @[...] */ vs block comments)
-    if let Some(annotation) = annotation_parser::parse_type_annotation(content) {
-        result.push_str("/* @[");
-        result.push_str(&annotation);
-        result.push_str("] */\n\n");
-    }
-
-    // Parse the RON content (without annotation) for formatting
+    // Skip any leading comments (including old-style type annotations)
     let ron_content = if content.trim_start().starts_with("/*") {
-        // Skip past the type annotation
+        // Skip past any block comment
         if let Some(end_idx) = content.find("*/") {
             &content[end_idx + 2..]
         } else {
@@ -391,11 +380,12 @@ mod tests {
     }
 
     #[test]
-    fn test_with_type_annotation() {
+    fn test_with_leading_comment() {
+        // Comments are now stripped during formatting (type annotations are set on RustAnalyzer)
         let input = "/* @[crate::User] */\nUser(id: 1)";
         let formatted = format_ron(input);
         println!("Formatted:\n{}", formatted);
-        assert!(formatted.contains("/* @[crate::User] */"));
+        // The comment is skipped, only the RON content is formatted
         assert!(formatted.contains("User("));
         assert!(formatted.contains("    id: 1,"));
     }
