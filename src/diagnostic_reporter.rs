@@ -1,7 +1,3 @@
-#[cfg(feature = "cli")]
-use ariadne::{Color, Label, Report, ReportKind, Source};
-#[cfg(feature = "cli")]
-use std::path::Path;
 use tower_lsp::lsp_types::{Diagnostic as LspDiagnostic, DiagnosticSeverity};
 
 /// A diagnostic that is independent of the output format (LSP or ariadne)
@@ -88,50 +84,4 @@ impl Diagnostic {
             ..Default::default()
         }
     }
-
-    /// Report using ariadne (for CLI output)
-    #[cfg(feature = "cli")]
-    pub fn report_ariadne(&self, file_path: &Path, source: &str) {
-        let report_kind = match self.severity {
-            Severity::Error => ReportKind::Error,
-            Severity::Warning => ReportKind::Warning,
-            Severity::Info => ReportKind::Advice,
-        };
-
-        let color = match self.severity {
-            Severity::Error => Color::Red,
-            Severity::Warning => Color::Yellow,
-            Severity::Info => Color::Blue,
-        };
-
-        // Convert line/col to byte offset
-        let byte_offset = get_byte_offset(source, self.line as usize, self.col_start as usize);
-        let byte_end = get_byte_offset(source, self.line as usize, self.col_end as usize);
-
-        Report::build(report_kind, file_path.display().to_string(), byte_offset)
-            .with_message(&self.message)
-            .with_label(
-                Label::new((file_path.display().to_string(), byte_offset..byte_end))
-                    .with_message(&self.message)
-                    .with_color(color),
-            )
-            .finish()
-            .eprint((file_path.display().to_string(), Source::from(source)))
-            .unwrap();
-    }
-}
-
-/// Convert line/col position to byte offset in source
-#[cfg(feature = "cli")]
-fn get_byte_offset(source: &str, line: usize, col: usize) -> usize {
-    let mut byte_offset = 0;
-    for (i, line_text) in source.lines().enumerate() {
-        if i == line {
-            // Add the column offset
-            return byte_offset + col.min(line_text.len());
-        }
-        // Add line length + newline
-        byte_offset += line_text.len() + 1;
-    }
-    byte_offset
 }

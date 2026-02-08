@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer};
+use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 #[derive(Debug)]
 pub struct Document {
@@ -1475,9 +1475,13 @@ User(
             ron::from_str(original_ron_part).expect("Original should parse");
         let formatted_parsed = ron::from_str::<ron::Value>(ron_part);
 
-        assert!(formatted_parsed.is_ok(),
-                "Formatted RON should be parseable.\n\nOriginal RON:\n{}\n\nFormatted RON:\n{}\n\nError: {:?}",
-                original_ron_part, ron_part, formatted_parsed.as_ref().err());
+        assert!(
+            formatted_parsed.is_ok(),
+            "Formatted RON should be parseable.\n\nOriginal RON:\n{}\n\nFormatted RON:\n{}\n\nError: {:?}",
+            original_ron_part,
+            ron_part,
+            formatted_parsed.as_ref().err()
+        );
 
         let formatted_parsed = formatted_parsed.unwrap();
         assert_eq!(
@@ -1655,152 +1659,11 @@ PostReference(
     }
 }
 
-#[cfg(feature = "cli")]
-use clap::{Parser, Subcommand};
+pub async fn serve() {
+    // Run as LSP server
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
 
-#[cfg(feature = "cli")]
-#[derive(Parser)]
-#[command(name = "ron-lsp")]
-#[command(about = "LSP server and validator for RON files", long_about = None, version)]
-pub struct Cli {
-    #[command(subcommand)]
-    pub command: Option<Commands>,
-}
-
-#[cfg(feature = "cli")]
-#[derive(Subcommand)]
-pub enum Commands {
-    /// Check RON files in a directory for errors
-    Check {
-        /// Directory to check (defaults to current directory)
-        #[arg(default_value = ".")]
-        directory: PathBuf,
-    },
-}
-
-#[cfg(feature = "cli")]
-pub async fn run_check(path: PathBuf) {
-    use std::fs;
-    use walkdir::WalkDir;
-
-    // Check if path is a file or directory
-    let is_file = path.is_file();
-
-    // Find workspace root by looking for Cargo.toml
-    let workspace_root = {
-        let start_dir = if is_file {
-            path.parent().unwrap_or_else(|| std::path::Path::new("."))
-        } else {
-            &path
-        };
-
-        let mut current = start_dir;
-        loop {
-            if current.join("Cargo.toml").exists() {
-                break current;
-            }
-            match current.parent() {
-                Some(parent) => current = parent,
-                None => break std::path::Path::new("."),
-            }
-        }
-    };
-
-    let config = match Config::try_load_from_dir(workspace_root) {
-        Ok(Some(config)) => config,
-        Ok(None) => Config::default(),
-        Err(e) => {
-            eprintln!("Failed to load ron.toml config: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    eprintln!(
-        "Checking RON files in: {:?}",
-        path.canonicalize().unwrap_or(path.clone())
-    );
-
-    // Initialize the Rust analyzer with workspace root
-    let analyzer = Arc::new(rust_analyzer::RustAnalyzer::new());
-    analyzer.set_workspace_root(workspace_root).await;
-
-    let types = analyzer.get_all_types().await;
-    eprintln!("Found {} types in workspace", types.len());
-
-    let mut total_files = 0;
-    let mut files_with_errors = 0;
-    let mut total_errors = 0;
-
-    // Collect files to check
-    let files_to_check: Vec<PathBuf> = if is_file {
-        vec![path.clone()]
-    } else {
-        WalkDir::new(&path)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path().to_path_buf())
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("ron"))
-            .collect()
-    };
-
-    // Process each file
-    for file_path in files_to_check {
-        total_files += 1;
-
-        // Read the file
-        let content = match fs::read_to_string(&file_path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Error reading {}: {}", file_path.display(), e);
-                continue;
-            }
-        };
-
-        // Parse type annotation
-        let type_annotation = annotation_parser::parse_type_annotation(&content)
-            .or_else(|| config.match_module_path(&file_path).cloned());
-
-        if let Some(type_path) = type_annotation {
-            if let Some(type_info) = analyzer.get_type_info(&type_path).await {
-                // Validate the file
-                let mut diagnostics =
-                    diagnostics::validate_ron_portable(&content, &type_info, analyzer.clone())
-                        .await;
-
-                if !diagnostics.is_empty() {
-                    files_with_errors += 1;
-                    total_errors += diagnostics.len();
-
-                    // Sort diagnostics by line and column (first to last)
-                    diagnostics.sort();
-
-                    // Report diagnostics using ariadne
-                    for diagnostic in diagnostics {
-                        diagnostic.report_ariadne(&file_path, &content);
-                    }
-                }
-            } else {
-                files_with_errors += 1;
-                total_errors += 1;
-                eprintln!(
-                    "\n{}: Could not find type: {}\n",
-                    file_path.display(),
-                    type_path
-                );
-            }
-        }
-        // Files without type annotations are skipped silently
-    }
-
-    eprintln!("\nChecked {} RON files", total_files);
-    if total_errors > 0 {
-        eprintln!(
-            "{} files with errors ({} total errors)",
-            files_with_errors, total_errors
-        );
-        std::process::exit(1);
-    } else {
-        eprintln!("All files valid!");
-    }
+    let (service, socket) = LspService::new(Backend::new);
+    Server::new(stdin, stdout, socket).serve(service).await;
 }

@@ -1,22 +1,9 @@
-#[cfg(feature = "cli")]
-use crate::diagnostic_reporter;
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use crate::tree_sitter_parser;
 use crate::ts_utils::ParsedEnumVariant;
 use ron::Value;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
-
-/// Validate RON with access to RustAnalyzer for recursive type lookups (returns portable diagnostics)
-#[cfg(feature = "cli")]
-pub async fn validate_ron_portable(
-    content: &str,
-    type_info: &TypeInfo,
-    analyzer: Arc<RustAnalyzer>,
-) -> Vec<diagnostic_reporter::Diagnostic> {
-    let lsp_diagnostics = validate_ron_with_analyzer(content, type_info, analyzer).await;
-    lsp_diagnostics_to_portable(&lsp_diagnostics)
-}
 
 /// Validate RON with access to RustAnalyzer for recursive type lookups
 pub async fn validate_ron_with_analyzer(
@@ -315,29 +302,6 @@ fn adjust_diagnostic_positions(diagnostics: Vec<Diagnostic>, line_offset: u32) -
         .collect()
 }
 
-/// Convert LSP diagnostics to portable format
-#[cfg(feature = "cli")]
-fn lsp_diagnostics_to_portable(diagnostics: &[Diagnostic]) -> Vec<diagnostic_reporter::Diagnostic> {
-    diagnostics
-        .iter()
-        .map(|d| {
-            let severity = match d.severity {
-                Some(DiagnosticSeverity::ERROR) => diagnostic_reporter::Severity::Error,
-                Some(DiagnosticSeverity::WARNING) => diagnostic_reporter::Severity::Warning,
-                _ => diagnostic_reporter::Severity::Info,
-            };
-
-            diagnostic_reporter::Diagnostic {
-                line: d.range.start.line,
-                col_start: d.range.start.character,
-                col_end: d.range.end.character,
-                severity,
-                message: d.message.clone(),
-            }
-        })
-        .collect()
-}
-
 /// Helper function for struct validation (async version with analyzer)
 async fn validate_struct_fields(
     content: &str,
@@ -376,7 +340,7 @@ async fn validate_struct_fields(
     }
 
     // Type check each field if we successfully parsed the RON
-    if let Ok(ref value) = parsed_value {
+    if let Ok(value) = parsed_value {
         // For named structs like MyStruct(...), the value might be wrapped
         let map = extract_map_from_value(value);
 

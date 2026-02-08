@@ -1,5 +1,0 @@
-[[types]]
-# Glob pattern used for matching
-glob = "**/*.post.ron"
-# Fully qualified type name
-type = "crate::models::Post"

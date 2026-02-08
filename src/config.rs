@@ -42,11 +42,7 @@ impl Config {
 
         self.types.iter().find_map(
             |TypePattern { glob, path }| {
-                if glob.is_match(rel) {
-                    Some(path)
-                } else {
-                    None
-                }
+                if glob.is_match(rel) { Some(path) } else { None }
             },
         )
     }
@@ -76,24 +72,4 @@ where
     String::deserialize(deserializer)
         .and_then(|glob| Glob::new(&glob).map_err(serde::de::Error::custom))
         .map(|glob| glob.compile_matcher())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_match_module_path() {
-        let config = Config {
-            types: vec![TypePattern {
-                glob: Glob::new("**/post.ron").unwrap().compile_matcher(),
-                path: "crate::models::Post".to_string(),
-            }],
-            root_dir: Some("Bobby".into()),
-        };
-
-        let result = config.match_module_path(r#"MyDirectory\ron-lsp\example\data\post.ron"#);
-
-        assert_eq!(result, Some(&"crate::models::Post".to_string()));
-    }
 }
