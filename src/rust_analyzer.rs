@@ -185,6 +185,81 @@ impl RustAnalyzer {
     pub fn has_type(&self, type_path: &str) -> bool {
         self.get_type_info(type_path).is_some()
     }
+
+    /// Validate that all field types referenced in registered types are known.
+    ///
+    /// This checks that every struct field and enum variant field references
+    /// a type that is either:
+    /// - A primitive type (bool, i32, String, etc.)
+    /// - A standard library generic (Option, Vec, HashMap, etc.)
+    /// - A type registered with this analyzer
+    ///
+    /// # Returns
+    /// A list of (type_name, field_name, unknown_type) tuples for any unknown types found.
+    pub fn validate_field_types(&self) -> Vec<(String, String, String)> {
+        let mut errors = Vec::new();
+
+        for type_info in self.type_cache.values() {
+            let fields: Vec<&FieldInfo> = match &type_info.kind {
+                TypeKind::Struct(fields) => fields.iter().collect(),
+                TypeKind::Enum(variants) => variants.iter().flat_map(|v| &v.fields).collect(),
+            };
+
+            for field in fields {
+                if let Some(unknown) = self.check_field_type_known(&field.type_name) {
+                    errors.push((
+                        type_info.name.clone(),
+                        field.name.clone(),
+                        unknown,
+                    ));
+                }
+            }
+        }
+
+        errors
+    }
+
+    /// Check if a field type is known, returning the unknown type name if not.
+    fn check_field_type_known(&self, type_name: &str) -> Option<String> {
+        let clean = type_name.replace(" ", "");
+
+        // Primitive types are always known
+        let primitives = [
+            "bool", "i8", "i16", "i32", "i64", "i128", "isize",
+            "u8", "u16", "u32", "u64", "u128", "usize",
+            "f32", "f64", "char", "String", "&str", "str", "()",
+        ];
+        if primitives.contains(&clean.as_str()) {
+            return None;
+        }
+
+        // Check generic wrappers and recurse into inner type
+        let wrappers = ["Option<", "Vec<", "Box<", "Rc<", "Arc<"];
+        for wrapper in wrappers {
+            if clean.starts_with(wrapper) && clean.ends_with('>') {
+                let inner = &clean[wrapper.len()..clean.len() - 1];
+                return self.check_field_type_known(inner);
+            }
+        }
+
+        // Other std generic types (we don't recurse into these for now)
+        if clean.contains("HashMap<")
+            || clean.contains("BTreeMap<")
+            || clean.contains("HashSet<")
+            || clean.contains("BTreeSet<")
+            || clean.starts_with("Result<")
+        {
+            return None;
+        }
+
+        // Check if it's a known custom type
+        if self.get_type_info(&clean).is_some() {
+            return None;
+        }
+
+        // Unknown type
+        Some(clean)
+    }
 }
 
 #[cfg(feature = "analyze")]
@@ -855,5 +930,143 @@ mod tests {
         let found = analyzer.get_type_info("MyStruct");
         assert!(found.is_some(), "Should find by simple name");
         assert_eq!(found.unwrap().name, "crate::deeply::nested::MyStruct");
+    }
+
+    #[test]
+    fn test_validate_field_types_all_known() {
+        let mut analyzer = RustAnalyzer::new("");
+
+        // Add User type
+        analyzer.add_type(TypeInfo {
+            name: "User".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "id".to_string(),
+                    type_name: "u32".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+                FieldInfo {
+                    name: "name".to_string(),
+                    type_name: "String".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+            ]),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        });
+
+        // Add Post type that references User
+        analyzer.add_type(TypeInfo {
+            name: "Post".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "id".to_string(),
+                    type_name: "u32".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+                FieldInfo {
+                    name: "author".to_string(),
+                    type_name: "User".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+                FieldInfo {
+                    name: "tags".to_string(),
+                    type_name: "Vec<String>".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+            ]),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        });
+
+        let errors = analyzer.validate_field_types();
+        assert!(errors.is_empty(), "All types should be known: {:?}", errors);
+    }
+
+    #[test]
+    fn test_validate_field_types_unknown() {
+        let mut analyzer = RustAnalyzer::new("");
+
+        // Add Post type that references unknown User type
+        analyzer.add_type(TypeInfo {
+            name: "Post".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "id".to_string(),
+                    type_name: "u32".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+                FieldInfo {
+                    name: "author".to_string(),
+                    type_name: "UnknownUser".to_string(), // NOT registered
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+            ]),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        });
+
+        let errors = analyzer.validate_field_types();
+        assert_eq!(errors.len(), 1, "Should find 1 unknown type");
+        assert_eq!(errors[0].0, "Post");
+        assert_eq!(errors[0].1, "author");
+        assert_eq!(errors[0].2, "UnknownUser");
+    }
+
+    #[test]
+    fn test_validate_field_types_unknown_in_vec() {
+        let mut analyzer = RustAnalyzer::new("");
+
+        // Add Container type with Vec<UnknownItem>
+        analyzer.add_type(TypeInfo {
+            name: "Container".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "items".to_string(),
+                type_name: "Vec<UnknownItem>".to_string(), // NOT registered
+                docs: None,
+                line: None,
+                column: None,
+                has_default: false,
+            }]),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        });
+
+        let errors = analyzer.validate_field_types();
+        assert_eq!(errors.len(), 1, "Should find 1 unknown type in Vec");
+        assert_eq!(errors[0].2, "UnknownItem");
     }
 }

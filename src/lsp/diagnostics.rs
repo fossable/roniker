@@ -950,34 +950,64 @@ async fn check_type_mismatch_with_enum_validation(
     field_name: &str,
     analyzer: &Arc<RustAnalyzer>,
 ) -> Option<String> {
-    // First do basic type checking
-    let basic_result = check_type_mismatch_deep(value, expected_type, content, field_name);
-    if basic_result.is_some() {
-        return basic_result;
-    }
-
-    // If the expected type is custom (not primitive), check if it's an enum and validate the variant
-    if !is_primitive_type(expected_type)
-        && let Some(field_value_text) = extract_field_value_text(content, field_name) {
+    // If the expected type is custom (not primitive), we need special handling
+    if !is_primitive_type(expected_type) && !is_std_generic_type(expected_type) {
+        if let Some(field_value_text) = extract_field_value_text(content, field_name) {
             let trimmed = field_value_text.trim();
 
-            // Check if the type is an enum
-            if let Some(type_info) = analyzer.get_type_info(expected_type).cloned()
-                && let TypeKind::Enum(variants) = &type_info.kind {
-                    // Extract the variant name from the text
-                    let variant_name = trimmed.split('(').next().unwrap_or(trimmed).trim();
+            // Extract the type/variant name from the RON text
+            let type_in_ron = trimmed.split('(').next().unwrap_or(trimmed).trim();
 
-                    // Check if this is a valid variant
-                    if !variants.iter().any(|v| v.name == variant_name) {
-                        return Some(format!(
-                            "unknown variant '{}' for enum {}",
-                            variant_name, expected_type
-                        ));
+            // Skip empty or primitive-looking values
+            if !type_in_ron.is_empty()
+                && type_in_ron.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                && !is_primitive_type(type_in_ron)
+            {
+                // Check if the expected type is known
+                if let Some(type_info) = analyzer.get_type_info(expected_type).cloned() {
+                    if let TypeKind::Enum(variants) = &type_info.kind {
+                        // For enum fields, check if this is a valid variant
+                        if !variants.iter().any(|v| v.name == type_in_ron) {
+                            return Some(format!(
+                                "unknown variant '{}' for enum {}",
+                                type_in_ron, expected_type
+                            ));
+                        }
+                        // Valid enum variant - no error
+                        return None;
+                    } else {
+                        // Expected type is a struct - the name in RON should match or be unnamed
+                        let expected_simple = expected_type.split("::").last().unwrap_or(expected_type);
+                        if type_in_ron != expected_simple {
+                            // Different type name - check if it's a known type or unknown
+                            if analyzer.get_type_info(type_in_ron).is_none() {
+                                return Some(format!("unknown type '{}'", type_in_ron));
+                            }
+                            // Known but different type - fall through to basic check
+                        } else {
+                            // Type names match - no type mismatch
+                            return None;
+                        }
                     }
+                } else {
+                    // Expected type is not registered in analyzer
+                    // If the RON type matches the expected type name, that's fine
+                    let expected_simple = expected_type.split("::").last().unwrap_or(expected_type);
+                    if type_in_ron == expected_simple {
+                        return None;
+                    }
+                    // Different type - check if it's known
+                    if trimmed.contains('(') && analyzer.get_type_info(type_in_ron).is_none() {
+                        return Some(format!("unknown type '{}'", type_in_ron));
+                    }
+                    // RON type is known or no parens - fall through
                 }
+            }
         }
+    }
 
-    None
+    // Do basic type checking for remaining cases
+    check_type_mismatch_deep(value, expected_type, content, field_name)
 }
 
 /// Deep type checking that also validates custom types by looking at raw text
@@ -2037,6 +2067,126 @@ PostReference(Post(
         assert!(
             diagnostics[1].message.contains("age"),
             "Second struct should be missing 'age' field"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_type_in_ron_file() {
+        // Create a struct with a custom type field
+        let analyzer = Arc::new(RustAnalyzer::new(""));
+        let type_info = TypeInfo {
+            name: "Post".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "id".to_string(),
+                    type_name: "u32".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+                FieldInfo {
+                    name: "author".to_string(),
+                    type_name: "User".to_string(), // User type - doesn't need to be registered for this test
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+            ]),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+
+        // The user writes "UnknownType" in the RON file - this type doesn't exist
+        let content = r#"Post(
+            id: 1,
+            author: UnknownType(name: "John"),
+        )"#;
+        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("unknown type 'UnknownType'")),
+            "Should report unknown type error for type written in RON file. Got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn test_known_type_in_ron_file_no_error() {
+        // Register User type with the analyzer
+        let user_type = TypeInfo {
+            name: "User".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "id".to_string(),
+                    type_name: "u32".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+                FieldInfo {
+                    name: "name".to_string(),
+                    type_name: "String".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+            ]),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+
+        let mut analyzer = RustAnalyzer::new("");
+        analyzer.add_type(user_type);
+        let analyzer = Arc::new(analyzer);
+
+        let type_info = TypeInfo {
+            name: "Post".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "id".to_string(),
+                    type_name: "u32".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+                FieldInfo {
+                    name: "author".to_string(),
+                    type_name: "User".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+            ]),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        };
+
+        // User type is known - should not error
+        let content = r#"Post(
+            id: 1,
+            author: User(id: 42, name: "John"),
+        )"#;
+        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+
+        assert!(
+            !diagnostics.iter().any(|d| d.message.contains("unknown type")),
+            "Should NOT report unknown type error when type is registered. Got: {:?}",
+            diagnostics
         );
     }
 }
