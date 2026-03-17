@@ -1,0 +1,14 @@
+// Example RON configuration file
+// Open this file with the LSP running to see completions and diagnostics
+
+Config(
+    debug: true,
+    port: 8080,
+    database: DatabaseConfig(
+        host: "localhost",
+        port: 5432,
+        username: "admin",
+        max_connections: Some(50),
+    ),
+    log_level: Info,
+)

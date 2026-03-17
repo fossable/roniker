@@ -951,57 +951,58 @@ async fn check_type_mismatch_with_enum_validation(
     analyzer: &Arc<RustAnalyzer>,
 ) -> Option<String> {
     // If the expected type is custom (not primitive), we need special handling
-    if !is_primitive_type(expected_type) && !is_std_generic_type(expected_type) {
-        if let Some(field_value_text) = extract_field_value_text(content, field_name) {
-            let trimmed = field_value_text.trim();
+    if !is_primitive_type(expected_type)
+        && !is_std_generic_type(expected_type)
+        && let Some(field_value_text) = extract_field_value_text(content, field_name)
+    {
+        let trimmed = field_value_text.trim();
 
-            // Extract the type/variant name from the RON text
-            let type_in_ron = trimmed.split('(').next().unwrap_or(trimmed).trim();
+        // Extract the type/variant name from the RON text
+        let type_in_ron = trimmed.split('(').next().unwrap_or(trimmed).trim();
 
-            // Skip empty or primitive-looking values
-            if !type_in_ron.is_empty()
-                && type_in_ron.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
-                && !is_primitive_type(type_in_ron)
-            {
-                // Check if the expected type is known
-                if let Some(type_info) = analyzer.get_type_info(expected_type).cloned() {
-                    if let TypeKind::Enum(variants) = &type_info.kind {
-                        // For enum fields, check if this is a valid variant
-                        if !variants.iter().any(|v| v.name == type_in_ron) {
-                            return Some(format!(
-                                "unknown variant '{}' for enum {}",
-                                type_in_ron, expected_type
-                            ));
-                        }
-                        // Valid enum variant - no error
-                        return None;
-                    } else {
-                        // Expected type is a struct - the name in RON should match or be unnamed
-                        let expected_simple = expected_type.split("::").last().unwrap_or(expected_type);
-                        if type_in_ron != expected_simple {
-                            // Different type name - check if it's a known type or unknown
-                            if analyzer.get_type_info(type_in_ron).is_none() {
-                                return Some(format!("unknown type '{}'", type_in_ron));
-                            }
-                            // Known but different type - fall through to basic check
-                        } else {
-                            // Type names match - no type mismatch
-                            return None;
-                        }
+        // Skip empty or primitive-looking values
+        if !type_in_ron.is_empty()
+            && type_in_ron.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+            && !is_primitive_type(type_in_ron)
+        {
+            // Check if the expected type is known
+            if let Some(type_info) = analyzer.get_type_info(expected_type).cloned() {
+                if let TypeKind::Enum(variants) = &type_info.kind {
+                    // For enum fields, check if this is a valid variant
+                    if !variants.iter().any(|v| v.name == type_in_ron) {
+                        return Some(format!(
+                            "unknown variant '{}' for enum {}",
+                            type_in_ron, expected_type
+                        ));
                     }
+                    // Valid enum variant - no error
+                    return None;
                 } else {
-                    // Expected type is not registered in analyzer
-                    // If the RON type matches the expected type name, that's fine
+                    // Expected type is a struct - the name in RON should match or be unnamed
                     let expected_simple = expected_type.split("::").last().unwrap_or(expected_type);
-                    if type_in_ron == expected_simple {
+                    if type_in_ron != expected_simple {
+                        // Different type name - check if it's a known type or unknown
+                        if analyzer.get_type_info(type_in_ron).is_none() {
+                            return Some(format!("unknown type '{}'", type_in_ron));
+                        }
+                        // Known but different type - fall through to basic check
+                    } else {
+                        // Type names match - no type mismatch
                         return None;
                     }
-                    // Different type - check if it's known
-                    if trimmed.contains('(') && analyzer.get_type_info(type_in_ron).is_none() {
-                        return Some(format!("unknown type '{}'", type_in_ron));
-                    }
-                    // RON type is known or no parens - fall through
                 }
+            } else {
+                // Expected type is not registered in analyzer
+                // If the RON type matches the expected type name, that's fine
+                let expected_simple = expected_type.split("::").last().unwrap_or(expected_type);
+                if type_in_ron == expected_simple {
+                    return None;
+                }
+                // Different type - check if it's known
+                if trimmed.contains('(') && analyzer.get_type_info(type_in_ron).is_none() {
+                    return Some(format!("unknown type '{}'", type_in_ron));
+                }
+                // RON type is known or no parens - fall through
             }
         }
     }

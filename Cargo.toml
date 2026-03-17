@@ -1,11 +1,14 @@
 [package]
 authors = ["Tyler Cook"]
-description = "Create custom LSPs for ron configurations at compile time."
+description = "Create custom LSPs for RON configurations at compile time."
 edition = "2024"
 license = "MIT"
 name = "roniker"
 repository = "https://github.com/fossable/roniker"
 version = "0.1.0"
+keywords = ["lsp", "ron", "language-server", "configuration", "ide"]
+categories = ["development-tools", "text-editors", "config"]
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"

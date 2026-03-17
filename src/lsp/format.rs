@@ -25,25 +25,21 @@ fn collect_inner_comments(node: &Node, content: &str) -> Vec<Comment> {
 
     for (i, child) in children.iter().enumerate() {
         let kind = child.kind();
-        if kind == "line_comment" || kind == "block_comment" {
-            if let Some(text) = ts_utils::node_text(child, content) {
-                let start_byte = child.start_byte();
+        if (kind == "line_comment" || kind == "block_comment")
+            && let Some(text) = ts_utils::node_text(child, content)
+        {
+            let start_byte = child.start_byte();
 
-                // Determine if this is a trailing comment by checking if there's
-                // a non-comment, non-punctuation sibling before it on the same line
-                let is_trailing = is_trailing_comment_in_context(
-                    content,
-                    start_byte,
-                    &children[..i],
-                );
+            // Determine if this is a trailing comment by checking if there's
+            // a non-comment, non-punctuation sibling before it on the same line
+            let is_trailing = is_trailing_comment_in_context(content, start_byte, &children[..i]);
 
-                result.push(Comment {
-                    text: text.to_string(),
-                    start_byte: child.start_byte(),
-                    end_byte: child.end_byte(),
-                    is_trailing,
-                });
-            }
+            result.push(Comment {
+                text: text.to_string(),
+                start_byte: child.start_byte(),
+                end_byte: child.end_byte(),
+                is_trailing,
+            });
         }
     }
 
@@ -103,18 +99,16 @@ fn collect_top_level_comments(root: &Node, content: &str, main_value: &Node) -> 
 
     for child in root.children(&mut cursor) {
         let kind = child.kind();
-        if kind == "line_comment" || kind == "block_comment" {
-            // Only include comments that come before the main value
-            if child.end_byte() <= main_value.start_byte() {
-                if let Some(text) = ts_utils::node_text(&child, content) {
-                    comments.push(Comment {
-                        text: text.to_string(),
-                        start_byte: child.start_byte(),
-                        end_byte: child.end_byte(),
-                        is_trailing: false,
-                    });
-                }
-            }
+        if (kind == "line_comment" || kind == "block_comment")
+            && child.end_byte() <= main_value.start_byte()
+            && let Some(text) = ts_utils::node_text(&child, content)
+        {
+            comments.push(Comment {
+                text: text.to_string(),
+                start_byte: child.start_byte(),
+                end_byte: child.end_byte(),
+                is_trailing: false,
+            });
         }
     }
 
