@@ -9,7 +9,7 @@ use roniker::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 
 fn main() {
     // Create a RustAnalyzer with the root configuration type
-    let mut analyzer = RustAnalyzer::new("Config");
+    let mut analyzer = RustAnalyzer::with_root_type("Config");
 
     // Register the root Config struct
     analyzer.add_type(TypeInfo {

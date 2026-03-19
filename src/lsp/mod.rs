@@ -52,9 +52,10 @@ impl Backend {
         {
             let documents = self.documents.read().await;
             if let Some(doc) = documents.get(uri)
-                && let Some(cached) = doc.context_cache.get(&pos_key) {
-                    return cached.clone();
-                }
+                && let Some(cached) = doc.context_cache.get(&pos_key)
+            {
+                return cached.clone();
+            }
         }
 
         // Not in cache, compute it
@@ -77,14 +78,15 @@ impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         // Log workspace info (types are now added via add_file/add_source methods)
         if let Some(workspace_folders) = &params.workspace_folders
-            && let Some(folder) = workspace_folders.first() {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("Workspace root: {:?}", folder.uri.to_file_path().unwrap()),
-                    )
-                    .await;
-            }
+            && let Some(folder) = workspace_folders.first()
+        {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("Workspace root: {:?}", folder.uri.to_file_path().unwrap()),
+                )
+                .await;
+        }
 
         // Log registered types
         let types = self.rust_analyzer.get_all_types();
@@ -198,9 +200,6 @@ impl LanguageServer for Backend {
             }
         };
 
-        // Get root type from rust_analyzer
-        let type_path = &self.rust_analyzer.root_type;
-
         // Get the word at cursor position - early return if none
         let word = match get_word_at_position(&content, position) {
             Some(w) => w,
@@ -216,25 +215,30 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, format!("Word at position: {}", word))
             .await;
 
-        // Find the nested context
-        self.client
-            .log_message(MessageType::INFO, format!("Type annotation: {}", type_path))
-            .await;
-        // Use cached context lookup
-        let contexts = self.get_type_contexts(&uri, position, &content).await;
+        // Use shared navigation helper if root type is set
+        let current_type_info = if let Some(type_path) = &self.rust_analyzer.root_type {
+            self.client
+                .log_message(MessageType::INFO, format!("Type annotation: {}", type_path))
+                .await;
+            // Use cached context lookup
+            let contexts = self.get_type_contexts(&uri, position, &content).await;
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("Found {} type contexts", contexts.len()),
+                )
+                .await;
+            self.navigate_to_innermost_type(type_path, &contexts).await
+        } else {
+            None
+        };
         self.client
             .log_message(
                 MessageType::INFO,
-                format!("Found {} type contexts", contexts.len()),
-            )
-            .await;
-
-        // Use shared navigation helper
-        let current_type_info = self.navigate_to_innermost_type(type_path, &contexts).await;
-        self.client
-            .log_message(
-                MessageType::INFO,
-                format!("Final type info: {:?}", current_type_info.as_ref().map(|i| &i.name)),
+                format!(
+                    "Final type info: {:?}",
+                    current_type_info.as_ref().map(|i| &i.name)
+                ),
             )
             .await;
 
@@ -412,21 +416,22 @@ impl LanguageServer for Backend {
             // Check if we're on a field, and if the word is a variant of that field's type
             // e.g., in "post_type: Short", if cursor is near Short, check if it's a variant of PostType
             if let Some(field_name) = tree_sitter_parser::get_field_at_position(&content, position)
-                && let Some(field) = info.find_field(&field_name) {
-                    // Get the type of this specific field
-                    if let Some(field_type_info) =
-                        self.rust_analyzer.get_type_info(&field.type_name).cloned()
-                    {
-                        // Check if word is a variant of this field's type
-                        if let Some(variant) = field_type_info.find_variant(&word) {
-                            return create_location_response(
-                                &field_type_info.source_file,
-                                variant.line,
-                                variant.column,
-                            );
-                        }
+                && let Some(field) = info.find_field(&field_name)
+            {
+                // Get the type of this specific field
+                if let Some(field_type_info) =
+                    self.rust_analyzer.get_type_info(&field.type_name).cloned()
+                {
+                    // Check if word is a variant of this field's type
+                    if let Some(variant) = field_type_info.find_variant(&word) {
+                        return create_location_response(
+                            &field_type_info.source_file,
+                            variant.line,
+                            variant.column,
+                        );
                     }
                 }
+            }
         }
 
         // If no type annotation, or word doesn't match a field, try to find as a type
@@ -454,9 +459,6 @@ impl LanguageServer for Backend {
             }
         };
 
-        // Get root type from rust_analyzer
-        let type_path = &self.rust_analyzer.root_type;
-
         // Get the word at cursor position
         let word = match get_word_at_position(&content, position) {
             Some(w) => w,
@@ -464,56 +466,59 @@ impl LanguageServer for Backend {
         };
 
         {
-            // Use cached context lookup
-            let contexts = self.get_type_contexts(&uri, position, &content).await;
-
-            // Use shared navigation helper
-            let current_type_info = self.navigate_to_innermost_type(type_path, &contexts).await;
+            // Use shared navigation helper if root type is set
+            let current_type_info = if let Some(type_path) = &self.rust_analyzer.root_type {
+                let contexts = self.get_type_contexts(&uri, position, &content).await;
+                self.navigate_to_innermost_type(type_path, &contexts).await
+            } else {
+                None
+            };
 
             // Now check what the word at cursor is
             if let Some(type_info) = current_type_info {
                 // Case 1: Hovering over a field name
                 if let Some(field_name) =
                     tree_sitter_parser::get_field_at_position(&content, position)
-                    && field_name == word {
-                        // First check if we're in an enum variant's fields
-                        if let Some(variant_name) =
-                            tree_sitter_parser::find_current_variant_context(&content, position)
-                            && let Some(variant) = type_info.find_variant(&variant_name)
-                                && let Some(field) =
-                                    variant.fields.iter().find(|f| f.name == field_name)
-                                {
-                                    return Ok(Some(Hover {
-                                        contents: HoverContents::Markup(MarkupContent {
-                                            kind: MarkupKind::Markdown,
-                                            value: format!(
-                                                "```rust\n{}: {}\n```\n\n{}",
-                                                field.name,
-                                                field.type_name,
-                                                field.docs.as_deref().unwrap_or("")
-                                            ),
-                                        }),
-                                        range: None,
-                                    }));
-                                }
-
-                        // Otherwise check struct fields
-                        if let Some(fields) = type_info.fields()
-                            && let Some(field) = fields.iter().find(|f| f.name == field_name) {
-                                return Ok(Some(Hover {
-                                    contents: HoverContents::Markup(MarkupContent {
-                                        kind: MarkupKind::Markdown,
-                                        value: format!(
-                                            "```rust\n{}: {}\n```\n\n{}",
-                                            field.name,
-                                            field.type_name,
-                                            field.docs.as_deref().unwrap_or("")
-                                        ),
-                                    }),
-                                    range: None,
-                                }));
-                            }
+                    && field_name == word
+                {
+                    // First check if we're in an enum variant's fields
+                    if let Some(variant_name) =
+                        tree_sitter_parser::find_current_variant_context(&content, position)
+                        && let Some(variant) = type_info.find_variant(&variant_name)
+                        && let Some(field) = variant.fields.iter().find(|f| f.name == field_name)
+                    {
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: format!(
+                                    "```rust\n{}: {}\n```\n\n{}",
+                                    field.name,
+                                    field.type_name,
+                                    field.docs.as_deref().unwrap_or("")
+                                ),
+                            }),
+                            range: None,
+                        }));
                     }
+
+                    // Otherwise check struct fields
+                    if let Some(fields) = type_info.fields()
+                        && let Some(field) = fields.iter().find(|f| f.name == field_name)
+                    {
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: format!(
+                                    "```rust\n{}: {}\n```\n\n{}",
+                                    field.name,
+                                    field.type_name,
+                                    field.docs.as_deref().unwrap_or("")
+                                ),
+                            }),
+                            range: None,
+                        }));
+                    }
+                }
 
                 // Case 2: Hovering over a variant name
                 if let Some(variant) = type_info.find_variant(&word) {
@@ -562,51 +567,52 @@ impl LanguageServer for Backend {
                 // Case 4: Check if hovering over a field value that's a variant (like "Short" in "post_type: Short")
                 if let Some(field_name) =
                     tree_sitter_parser::get_field_at_position(&content, position)
-                    && let Some(field) = type_info.find_field(&field_name) {
-                        // Get the type of this field
-                        if let Some(field_type_info) =
-                            self.rust_analyzer.get_type_info(&field.type_name).cloned()
-                        {
-                            // Check if word is a variant of this field's type
-                            if let Some(variant) = field_type_info.find_variant(&word) {
-                                let mut hover_text = format!(
-                                    "```rust\nenum {}\n```\n\n**Variant:** `{}`",
-                                    field_type_info
-                                        .name
-                                        .split("::")
-                                        .last()
-                                        .unwrap_or(&field_type_info.name),
-                                    variant.name
-                                );
+                    && let Some(field) = type_info.find_field(&field_name)
+                {
+                    // Get the type of this field
+                    if let Some(field_type_info) =
+                        self.rust_analyzer.get_type_info(&field.type_name).cloned()
+                    {
+                        // Check if word is a variant of this field's type
+                        if let Some(variant) = field_type_info.find_variant(&word) {
+                            let mut hover_text = format!(
+                                "```rust\nenum {}\n```\n\n**Variant:** `{}`",
+                                field_type_info
+                                    .name
+                                    .split("::")
+                                    .last()
+                                    .unwrap_or(&field_type_info.name),
+                                variant.name
+                            );
 
-                                if let Some(ref docs) = variant.docs {
-                                    hover_text.push_str(&format!("\n\n{}", docs));
-                                }
-
-                                if !variant.fields.is_empty() {
-                                    hover_text.push_str("\n\n**Fields:**\n");
-                                    for vfield in &variant.fields {
-                                        hover_text.push_str(&format!(
-                                            "- `{}`: `{}`",
-                                            vfield.name, vfield.type_name
-                                        ));
-                                        if let Some(ref vfield_docs) = vfield.docs {
-                                            hover_text.push_str(&format!(" - {}", vfield_docs));
-                                        }
-                                        hover_text.push('\n');
-                                    }
-                                }
-
-                                return Ok(Some(Hover {
-                                    contents: HoverContents::Markup(MarkupContent {
-                                        kind: MarkupKind::Markdown,
-                                        value: hover_text,
-                                    }),
-                                    range: None,
-                                }));
+                            if let Some(ref docs) = variant.docs {
+                                hover_text.push_str(&format!("\n\n{}", docs));
                             }
+
+                            if !variant.fields.is_empty() {
+                                hover_text.push_str("\n\n**Fields:**\n");
+                                for vfield in &variant.fields {
+                                    hover_text.push_str(&format!(
+                                        "- `{}`: `{}`",
+                                        vfield.name, vfield.type_name
+                                    ));
+                                    if let Some(ref vfield_docs) = vfield.docs {
+                                        hover_text.push_str(&format!(" - {}", vfield_docs));
+                                    }
+                                    hover_text.push('\n');
+                                }
+                            }
+
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value: hover_text,
+                                }),
+                                range: None,
+                            }));
                         }
                     }
+                }
             }
         }
 
@@ -637,14 +643,13 @@ impl LanguageServer for Backend {
             }
         };
 
-        // Get root type from rust_analyzer
-        let type_path = &self.rust_analyzer.root_type;
-
-        // Get type contexts
-        let contexts = self.get_type_contexts(&uri, position, &content).await;
-
-        // Navigate to innermost type using shared helper
-        let current_type_info = self.navigate_to_innermost_type(type_path, &contexts).await;
+        // Navigate to innermost type using shared helper if root type is set
+        let current_type_info = if let Some(type_path) = &self.rust_analyzer.root_type {
+            let contexts = self.get_type_contexts(&uri, position, &content).await;
+            self.navigate_to_innermost_type(type_path, &contexts).await
+        } else {
+            None
+        };
 
         if let Some(type_info) = current_type_info {
             let completions = completion::generate_completions_for_type(
@@ -683,13 +688,12 @@ impl LanguageServer for Backend {
             }
         };
 
-        // Get root type from rust_analyzer
-        let type_path = &self.rust_analyzer.root_type;
-
-        self.client
-            .log_message(MessageType::INFO, format!("Root type: {}", type_path))
-            .await;
-        if let Some(type_info) = self.rust_analyzer.get_type_info(type_path).cloned() {
+        if let Some(type_path) = &self.rust_analyzer.root_type {
+            self.client
+                .log_message(MessageType::INFO, format!("Root type: {}", type_path))
+                .await;
+        }
+        if let Some(type_info) = self.rust_analyzer.root_type_info().cloned() {
             self.client
                 .log_message(
                     MessageType::INFO,
@@ -808,39 +812,36 @@ impl LanguageServer for Backend {
         if let Some(doc) = documents.get(&uri)
             && let Some(field_name) =
                 tree_sitter_parser::get_field_at_position(&doc.content, position)
-            {
-                // Find all occurrences of this field name in the document
-                let mut changes = Vec::new();
+        {
+            // Find all occurrences of this field name in the document
+            let mut changes = Vec::new();
 
-                for (line_num, line) in doc.content.lines().enumerate() {
-                    if let Some(start) = line.find(&field_name) {
-                        // Check if this is actually the field name (followed by a colon)
-                        let after = &line[start + field_name.len()..];
-                        if after.trim_start().starts_with(':') {
-                            changes.push(TextEdit {
-                                range: Range::new(
-                                    Position::new(line_num as u32, start as u32),
-                                    Position::new(
-                                        line_num as u32,
-                                        (start + field_name.len()) as u32,
-                                    ),
-                                ),
-                                new_text: new_name.clone(),
-                            });
-                        }
+            for (line_num, line) in doc.content.lines().enumerate() {
+                if let Some(start) = line.find(&field_name) {
+                    // Check if this is actually the field name (followed by a colon)
+                    let after = &line[start + field_name.len()..];
+                    if after.trim_start().starts_with(':') {
+                        changes.push(TextEdit {
+                            range: Range::new(
+                                Position::new(line_num as u32, start as u32),
+                                Position::new(line_num as u32, (start + field_name.len()) as u32),
+                            ),
+                            new_text: new_name.clone(),
+                        });
                     }
                 }
-
-                if !changes.is_empty() {
-                    let mut map = std::collections::HashMap::new();
-                    map.insert(tower_lsp::lsp_types::Url::parse(&uri).unwrap(), changes);
-
-                    return Ok(Some(WorkspaceEdit {
-                        changes: Some(map),
-                        ..Default::default()
-                    }));
-                }
             }
+
+            if !changes.is_empty() {
+                let mut map = std::collections::HashMap::new();
+                map.insert(tower_lsp::lsp_types::Url::parse(&uri).unwrap(), changes);
+
+                return Ok(Some(WorkspaceEdit {
+                    changes: Some(map),
+                    ..Default::default()
+                }));
+            }
+        }
 
         Ok(None)
     }
@@ -938,7 +939,10 @@ impl Backend {
         contexts: &[tree_sitter_parser::TypeContext],
     ) -> Option<rust_analyzer::TypeInfo> {
         // Start with the top-level type
-        let mut current_type_info = self.rust_analyzer.get_type_info(top_level_type_path).cloned();
+        let mut current_type_info = self
+            .rust_analyzer
+            .get_type_info(top_level_type_path)
+            .cloned();
 
         // Navigate through the nested contexts (skip first since it's the top-level type we already have)
         for context in contexts.iter().skip(1) {
@@ -966,7 +970,10 @@ impl Backend {
             }
 
             // Try as direct type lookup
-            let direct_lookup = self.rust_analyzer.get_type_info(&context.type_name).cloned();
+            let direct_lookup = self
+                .rust_analyzer
+                .get_type_info(&context.type_name)
+                .cloned();
             if direct_lookup.is_some() {
                 current_type_info = direct_lookup;
             } else {
@@ -984,21 +991,20 @@ impl Backend {
                 }
 
                 // If not found as a variant of the current type, try to find it in field types
-                if !found_via_variant
-                    && let Some(fields) = info.fields() {
-                        for field in fields {
-                            if let Some(field_type_info) =
-                                self.rust_analyzer.get_type_info(&field.type_name).cloned()
-                            {
-                                // Check if this field's type has a variant with the context name
-                                if field_type_info.find_variant(&context.type_name).is_some() {
-                                    current_type_info = Some(field_type_info);
-                                    found_via_variant = true;
-                                    break;
-                                }
+                if !found_via_variant && let Some(fields) = info.fields() {
+                    for field in fields {
+                        if let Some(field_type_info) =
+                            self.rust_analyzer.get_type_info(&field.type_name).cloned()
+                        {
+                            // Check if this field's type has a variant with the context name
+                            if field_type_info.find_variant(&context.type_name).is_some() {
+                                current_type_info = Some(field_type_info);
+                                found_via_variant = true;
+                                break;
                             }
                         }
                     }
+                }
 
                 if !found_via_variant {
                     current_type_info = None;
@@ -1068,24 +1074,21 @@ impl Backend {
     }
 
     async fn publish_diagnostics(&self, uri: &str, content: &str) {
-        // Get root type from rust_analyzer
-        let type_path = &self.rust_analyzer.root_type;
-
         self.client
             .log_message(
                 MessageType::INFO,
                 format!(
-                    "Publishing diagnostics for {} with root type: {}",
-                    uri, type_path
+                    "Publishing diagnostics for {} with root type: {:?}",
+                    uri, self.rust_analyzer.root_type
                 ),
             )
             .await;
 
-        let diagnostics = if let Some(type_info) = self.rust_analyzer.get_type_info(type_path).cloned() {
+        let diagnostics = if let Some(type_info) = self.rust_analyzer.root_type_info().cloned() {
             self.client
                 .log_message(
                     MessageType::INFO,
-                    format!("Found type info for {}: {:?}", type_path, type_info.name),
+                    format!("Found type info for: {:?}", type_info.name),
                 )
                 .await;
             let diags = diagnostics::validate_ron_with_analyzer(
@@ -1102,18 +1105,7 @@ impl Backend {
                 .await;
             diags
         } else {
-            self.client
-                .log_message(
-                    MessageType::WARNING,
-                    format!("Could not find type: {}", type_path),
-                )
-                .await;
-            vec![Diagnostic {
-                range: Range::new(Position::new(0, 0), Position::new(0, 1)),
-                severity: Some(DiagnosticSeverity::ERROR),
-                message: format!("Could not find type: {}", type_path),
-                ..Default::default()
-            }]
+            vec![]
         };
 
         self.client
@@ -1153,7 +1145,7 @@ mod tests {
     #[tokio::test]
     async fn test_lsp_hover_on_struct_field() {
         // Set up analyzer with a type with documented fields
-        let mut analyzer = RustAnalyzer::new("crate::User");
+        let mut analyzer = RustAnalyzer::with_root_type("crate::User");
         analyzer.add_type(TypeInfo {
             name: "crate::User".to_string(),
             kind: TypeKind::Struct(vec![
@@ -1278,7 +1270,7 @@ mod tests {
     #[tokio::test]
     async fn test_lsp_hover_on_enum_variant() {
         // Set up an enum type
-        let mut analyzer = RustAnalyzer::new("crate::Status");
+        let mut analyzer = RustAnalyzer::with_root_type("crate::Status");
         analyzer.add_type(TypeInfo {
             name: "crate::Status".to_string(),
             kind: TypeKind::Enum(vec![
@@ -1380,7 +1372,7 @@ mod tests {
             has_default: false,
         };
 
-        let mut analyzer = RustAnalyzer::new("crate::Config");
+        let mut analyzer = RustAnalyzer::with_root_type("crate::Config");
         analyzer.add_type(config_type);
         let backend = create_test_backend_with_analyzer(analyzer).await;
 
@@ -1447,7 +1439,7 @@ mod tests {
             has_default: false,
         };
 
-        let mut analyzer = RustAnalyzer::new("crate::Simple");
+        let mut analyzer = RustAnalyzer::with_root_type("crate::Simple");
         analyzer.add_type(simple_type);
         let backend = create_test_backend_with_analyzer(analyzer).await;
 
@@ -1510,7 +1502,7 @@ mod tests {
             has_default: false,
         };
 
-        let mut analyzer = RustAnalyzer::new("crate::User");
+        let mut analyzer = RustAnalyzer::with_root_type("crate::User");
         analyzer.add_type(user_type);
         let backend = create_test_backend_with_analyzer(analyzer).await;
 

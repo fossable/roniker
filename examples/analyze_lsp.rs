@@ -10,11 +10,10 @@ use std::path::Path;
 
 fn main() {
     // Create a RustAnalyzer with the root configuration type path
-    let mut analyzer = RustAnalyzer::new("AppConfig");
+    let mut analyzer = RustAnalyzer::with_root_type("AppConfig");
 
     // Parse types from a Rust source file
-    let config_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/data/config_types.rs");
+    let config_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/data/config_types.rs");
 
     analyzer
         .add_file(&config_path)

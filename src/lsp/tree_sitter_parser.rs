@@ -48,9 +48,10 @@ pub fn find_type_context_at_position(content: &str, position: Position) -> Vec<T
         // Walk up the tree to collect all struct contexts
         loop {
             if current.kind() == "struct"
-                && let Some(type_name) = extract_struct_name(&current, content) {
-                    contexts.push(TypeContext { type_name });
-                }
+                && let Some(type_name) = extract_struct_name(&current, content)
+            {
+                contexts.push(TypeContext { type_name });
+            }
 
             match current.parent() {
                 Some(parent) => current = parent,
@@ -68,10 +69,11 @@ pub fn find_type_context_at_position(content: &str, position: Position) -> Vec<T
 fn extract_struct_name(node: &Node, content: &str) -> Option<String> {
     // A struct node's first child is typically the identifier (name)
     if let Some(first_child) = node.child(0)
-        && first_child.kind() == "identifier" {
-            let name = first_child.utf8_text(content.as_bytes()).ok()?;
-            return Some(name.to_string());
-        }
+        && first_child.kind() == "identifier"
+    {
+        let name = first_child.utf8_text(content.as_bytes()).ok()?;
+        return Some(name.to_string());
+    }
     None
 }
 
@@ -91,10 +93,11 @@ pub fn get_field_at_position(content: &str, position: Position) -> Option<String
         if current.kind() == "field" {
             // The first child of a field node is the identifier (field name)
             if let Some(field_name_node) = current.child(0)
-                && field_name_node.kind() == "identifier" {
-                    let field_name = field_name_node.utf8_text(content.as_bytes()).ok()?;
-                    return Some(field_name.to_string());
-                }
+                && field_name_node.kind() == "identifier"
+            {
+                let field_name = field_name_node.utf8_text(content.as_bytes()).ok()?;
+                return Some(field_name.to_string());
+            }
         }
 
         match current.parent() {
@@ -160,9 +163,10 @@ pub fn get_containing_field_context(content: &str, position: Position) -> Option
                 // This is the containing field - extract its name
                 if let Some(field_name_node) = current.child(0)
                     && field_name_node.kind() == "identifier"
-                        && let Ok(field_name) = field_name_node.utf8_text(content.as_bytes()) {
-                            return Some(field_name.to_string());
-                        }
+                    && let Ok(field_name) = field_name_node.utf8_text(content.as_bytes())
+                {
+                    return Some(field_name.to_string());
+                }
             } else {
                 // This is the first field we found (the one we're in)
                 found_current_field = true;
@@ -232,26 +236,27 @@ pub fn find_all_variant_field_locations(content: &str) -> Vec<VariantFieldLocati
 fn visit_fields(node: &Node, content: &str, locations: &mut Vec<VariantFieldLocation>) {
     // Check if this is a struct (potential variant)
     if node.kind() == "struct"
-        && let Some(variant_name) = extract_struct_name(node, content) {
-            // This is a named struct, check if it's a variant (uppercase start)
-            if variant_name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_uppercase())
-            {
-                // Look for the containing field by checking parent
-                let containing_field_name = find_parent_field_name(node, content);
+        && let Some(variant_name) = extract_struct_name(node, content)
+    {
+        // This is a named struct, check if it's a variant (uppercase start)
+        if variant_name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_uppercase())
+        {
+            // Look for the containing field by checking parent
+            let containing_field_name = find_parent_field_name(node, content);
 
-                // Now collect all fields inside this variant
-                collect_fields_in_node(
-                    node,
-                    content,
-                    &variant_name,
-                    &containing_field_name,
-                    locations,
-                );
-            }
+            // Now collect all fields inside this variant
+            collect_fields_in_node(
+                node,
+                content,
+                &variant_name,
+                &containing_field_name,
+                locations,
+            );
         }
+    }
 
     // Recurse into children
     let mut cursor = node.walk();
@@ -358,10 +363,11 @@ fn collect_direct_field_names(
     for child in node.children(&mut cursor) {
         if child.kind() == "field"
             && let Some(field_name_node) = child.child(0)
-                && field_name_node.kind() == "identifier"
-                    && let Ok(field_name) = field_name_node.utf8_text(content.as_bytes()) {
-                        fields.insert(field_name.to_string());
-                    }
+            && field_name_node.kind() == "identifier"
+            && let Ok(field_name) = field_name_node.utf8_text(content.as_bytes())
+        {
+            fields.insert(field_name.to_string());
+        }
     }
 }
 

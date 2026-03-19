@@ -73,9 +73,9 @@ fn is_trailing_comment_in_context(
         if kind == "identifier" {
             // Check if this identifier is the first named child (struct name)
             // by seeing if there are any fields/values before it
-            let has_field_before = siblings_before.iter().any(|s| {
-                s.kind() == "field" || s.kind() == "map_entry"
-            });
+            let has_field_before = siblings_before
+                .iter()
+                .any(|s| s.kind() == "field" || s.kind() == "map_entry");
             if !has_field_before {
                 // This is likely the struct name, skip it
                 continue;
@@ -174,10 +174,42 @@ fn format_node(
     let kind = node.kind();
 
     match kind {
-        "struct" => format_struct(node, content, output, indent_level, indent_str, inline, emitted),
-        "array" => format_array(node, content, output, indent_level, indent_str, inline, emitted),
-        "map" => format_map(node, content, output, indent_level, indent_str, inline, emitted),
-        "tuple" => format_tuple(node, content, output, indent_level, indent_str, inline, emitted),
+        "struct" => format_struct(
+            node,
+            content,
+            output,
+            indent_level,
+            indent_str,
+            inline,
+            emitted,
+        ),
+        "array" => format_array(
+            node,
+            content,
+            output,
+            indent_level,
+            indent_str,
+            inline,
+            emitted,
+        ),
+        "map" => format_map(
+            node,
+            content,
+            output,
+            indent_level,
+            indent_str,
+            inline,
+            emitted,
+        ),
+        "tuple" => format_tuple(
+            node,
+            content,
+            output,
+            indent_level,
+            indent_str,
+            inline,
+            emitted,
+        ),
         "field" => format_field(node, content, output, indent_level, indent_str, emitted),
         "string" | "integer" | "float" | "boolean" | "char" | "identifier" | "unit" => {
             // Leaf nodes - just output their text
@@ -248,7 +280,14 @@ fn format_struct(
             }
 
             output.push_str(&indent_str.repeat(indent_level + 1));
-            format_field(field, content, output, indent_level + 1, indent_str, emitted);
+            format_field(
+                field,
+                content,
+                output,
+                indent_level + 1,
+                indent_str,
+                emitted,
+            );
 
             // Add comma after each field
             output.push(',');
@@ -365,7 +404,15 @@ fn format_field(
 
     // Get field value
     if let Some(value) = ts_utils::field_value(node) {
-        format_node(&value, content, output, indent_level, indent_str, false, emitted);
+        format_node(
+            &value,
+            content,
+            output,
+            indent_level,
+            indent_str,
+            false,
+            emitted,
+        );
     }
 }
 

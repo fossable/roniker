@@ -1,3 +1,5 @@
+#[cfg(feature = "analyze")]
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -6,8 +8,6 @@ use std::{
     fs,
     path::{Component, Path},
 };
-#[cfg(feature = "analyze")]
-use anyhow::{Context, Result};
 #[cfg(feature = "analyze")]
 use syn::{Fields, Item, ItemEnum, ItemStruct, ItemType};
 
@@ -84,28 +84,41 @@ impl TypeInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RustAnalyzer {
-    pub root_type: String,
+    pub root_type: Option<String>,
     type_cache: HashMap<String, TypeInfo>,
     type_aliases: HashMap<String, String>,
 }
 
+impl Default for RustAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RustAnalyzer {
-    /// Create a new RustAnalyzer with the given root type path (e.g., "crate::models::Config")
-    pub fn new(root_type: impl Into<String>) -> Self {
+    /// Create a new RustAnalyzer without a root type.
+    pub fn new() -> Self {
         Self {
-            root_type: root_type.into(),
+            root_type: None,
             type_cache: HashMap::new(),
             type_aliases: HashMap::new(),
         }
     }
 
-    /// Get the TypeInfo for the root type
-    ///
-    /// # Panics
-    /// Panics if the root type has not been registered with the analyzer.
-    pub fn root_type_info(&self) -> &TypeInfo {
-        self.get_type_info(&self.root_type)
-            .expect("root type not registered")
+    /// Create a new RustAnalyzer with the given root type path (e.g., "crate::models::Config")
+    pub fn with_root_type(root_type: impl Into<String>) -> Self {
+        Self {
+            root_type: Some(root_type.into()),
+            type_cache: HashMap::new(),
+            type_aliases: HashMap::new(),
+        }
+    }
+
+    /// Get the TypeInfo for the root type, if one is set.
+    pub fn root_type_info(&self) -> Option<&TypeInfo> {
+        self.root_type
+            .as_deref()
+            .and_then(|t| self.get_type_info(t))
     }
 
     /// Register a type directly with the analyzer.
@@ -207,11 +220,7 @@ impl RustAnalyzer {
 
             for field in fields {
                 if let Some(unknown) = self.check_field_type_known(&field.type_name) {
-                    errors.push((
-                        type_info.name.clone(),
-                        field.name.clone(),
-                        unknown,
-                    ));
+                    errors.push((type_info.name.clone(), field.name.clone(), unknown));
                 }
             }
         }
@@ -225,9 +234,8 @@ impl RustAnalyzer {
 
         // Primitive types are always known
         let primitives = [
-            "bool", "i8", "i16", "i32", "i64", "i128", "isize",
-            "u8", "u16", "u32", "u64", "u128", "usize",
-            "f32", "f64", "char", "String", "&str", "str", "()",
+            "bool", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128",
+            "usize", "f32", "f64", "char", "String", "&str", "str", "()",
         ];
         if primitives.contains(&clean.as_str()) {
             return None;
@@ -730,7 +738,7 @@ mod tests {
 
     #[test]
     fn test_rust_analyzer_serialization_roundtrip() {
-        let mut analyzer = RustAnalyzer::new("crate::Test");
+        let mut analyzer = RustAnalyzer::with_root_type("crate::Test");
         analyzer.add_type(TypeInfo {
             name: "Test".to_string(),
             kind: TypeKind::Struct(vec![]),
@@ -745,12 +753,12 @@ mod tests {
         let deserialized: RustAnalyzer = serde_json::from_str(&json).unwrap();
 
         assert!(deserialized.get_type_info("Test").is_some());
-        assert_eq!(deserialized.root_type, "crate::Test");
+        assert_eq!(deserialized.root_type, Some("crate::Test".to_string()));
     }
 
     #[test]
     fn test_add_source_with_prefix() {
-        let mut analyzer = RustAnalyzer::new("");
+        let mut analyzer = RustAnalyzer::new();
 
         let source = r#"
             /// A user in the system
@@ -791,7 +799,7 @@ mod tests {
 
     #[test]
     fn test_add_source_with_file_path() {
-        let mut analyzer = RustAnalyzer::new("");
+        let mut analyzer = RustAnalyzer::new();
 
         let source = r#"
             pub struct Config {
@@ -811,7 +819,7 @@ mod tests {
 
     #[test]
     fn test_add_type_directly() {
-        let mut analyzer = RustAnalyzer::new("");
+        let mut analyzer = RustAnalyzer::new();
 
         let type_info = TypeInfo {
             name: "crate::MyType".to_string(),
@@ -838,7 +846,7 @@ mod tests {
 
     #[test]
     fn test_remove_type() {
-        let mut analyzer = RustAnalyzer::new("");
+        let mut analyzer = RustAnalyzer::new();
 
         analyzer.add_type(TypeInfo {
             name: "crate::ToRemove".to_string(),
@@ -859,7 +867,7 @@ mod tests {
 
     #[test]
     fn test_clear() {
-        let mut analyzer = RustAnalyzer::new("");
+        let mut analyzer = RustAnalyzer::new();
 
         analyzer
             .add_source_with_prefix("crate", "pub struct A {} pub struct B {}")
@@ -874,7 +882,7 @@ mod tests {
 
     #[test]
     fn test_type_alias() {
-        let mut analyzer = RustAnalyzer::new("");
+        let mut analyzer = RustAnalyzer::new();
 
         analyzer.add_type(TypeInfo {
             name: "crate::RealType".to_string(),
@@ -896,7 +904,7 @@ mod tests {
 
     #[test]
     fn test_inline_module() {
-        let mut analyzer = RustAnalyzer::new("");
+        let mut analyzer = RustAnalyzer::new();
 
         let source = r#"
             pub mod inner {
@@ -914,7 +922,7 @@ mod tests {
 
     #[test]
     fn test_simple_name_lookup() {
-        let mut analyzer = RustAnalyzer::new("");
+        let mut analyzer = RustAnalyzer::new();
 
         analyzer.add_type(TypeInfo {
             name: "crate::deeply::nested::MyStruct".to_string(),
@@ -934,7 +942,7 @@ mod tests {
 
     #[test]
     fn test_validate_field_types_all_known() {
-        let mut analyzer = RustAnalyzer::new("");
+        let mut analyzer = RustAnalyzer::new();
 
         // Add User type
         analyzer.add_type(TypeInfo {
@@ -1006,7 +1014,7 @@ mod tests {
 
     #[test]
     fn test_validate_field_types_unknown() {
-        let mut analyzer = RustAnalyzer::new("");
+        let mut analyzer = RustAnalyzer::new();
 
         // Add Post type that references unknown User type
         analyzer.add_type(TypeInfo {
@@ -1045,7 +1053,7 @@ mod tests {
 
     #[test]
     fn test_validate_field_types_unknown_in_vec() {
-        let mut analyzer = RustAnalyzer::new("");
+        let mut analyzer = RustAnalyzer::new();
 
         // Add Container type with Vec<UnknownItem>
         analyzer.add_type(TypeInfo {

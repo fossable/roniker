@@ -134,9 +134,10 @@ pub fn struct_name<'a>(node: &Node, content: &'a str) -> Option<&'a str> {
 
     // First child should be identifier if it's a named struct
     if let Some(first_child) = node.child(0)
-        && first_child.kind() == "identifier" {
-            return node_text(&first_child, content);
-        }
+        && first_child.kind() == "identifier"
+    {
+        return node_text(&first_child, content);
+    }
     None
 }
 
@@ -148,9 +149,10 @@ pub fn field_name<'a>(node: &Node, content: &'a str) -> Option<&'a str> {
 
     // First child should be the identifier
     if let Some(first_child) = node.child(0)
-        && first_child.kind() == "identifier" {
-            return node_text(&first_child, content);
-        }
+        && first_child.kind() == "identifier"
+    {
+        return node_text(&first_child, content);
+    }
     None
 }
 
@@ -322,17 +324,18 @@ pub fn find_potential_variants<'a>(tree: &'a Tree, content: &str) -> Vec<Node<'a
 fn collect_potential_variants<'a>(node: &Node<'a>, content: &str, results: &mut Vec<Node<'a>>) {
     if node.kind() == "identifier"
         && let Some(text) = node_text(node, content)
-            && text.chars().next().is_some_and(|c| c.is_uppercase()) {
-                // Check if this is not a field name (field names are first child of field nodes)
-                let is_field_name = node
-                    .parent()
-                    .map(|p| p.kind() == "field" && p.child(0).map(|c| c.id()) == Some(node.id()))
-                    .unwrap_or(false);
+        && text.chars().next().is_some_and(|c| c.is_uppercase())
+    {
+        // Check if this is not a field name (field names are first child of field nodes)
+        let is_field_name = node
+            .parent()
+            .map(|p| p.kind() == "field" && p.child(0).map(|c| c.id()) == Some(node.id()))
+            .unwrap_or(false);
 
-                if !is_field_name {
-                    results.push(*node);
-                }
-            }
+        if !is_field_name {
+            results.push(*node);
+        }
+    }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {

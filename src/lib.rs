@@ -14,7 +14,7 @@
 //! use roniker::{RustAnalyzer, TypeInfo, TypeKind, FieldInfo};
 //!
 //! // Create an analyzer with the root configuration type
-//! let mut analyzer = RustAnalyzer::new("crate::config::Config");
+//! let mut analyzer = RustAnalyzer::with_root_type("crate::config::Config");
 //!
 //! // Register types directly
 //! analyzer.add_type(TypeInfo {
@@ -37,7 +37,7 @@
 //! });
 //!
 //! // Query type information
-//! let config = analyzer.root_type_info();
+//! let config = analyzer.root_type_info().unwrap();
 //! assert_eq!(config.name, "crate::config::Config");
 //! ```
 

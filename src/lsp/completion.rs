@@ -1,5 +1,5 @@
-use crate::rust_analyzer::{RustAnalyzer, TypeInfo, TypeKind};
 use super::tree_sitter_parser;
+use crate::rust_analyzer::{RustAnalyzer, TypeInfo, TypeKind};
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent, MarkupKind,
@@ -209,10 +209,7 @@ fn generate_field_completions(
                         } else {
                             Some(Documentation::MarkupContent(MarkupContent {
                                 kind: MarkupKind::Markdown,
-                                value: format!(
-                                    "```rust\n{}: {}\n```",
-                                    field.name, field.type_name
-                                ),
+                                value: format!("```rust\n{}: {}\n```", field.name, field.type_name),
                             }))
                         };
 
@@ -599,9 +596,8 @@ mod tests {
         let content = "MyEnum::StructVariant(\n    \n)";
         let position = Position::new(1, 4); // Inside the parens
 
-        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new(""));
-        let completions =
-            generate_completions_for_type(content, position, &type_info, analyzer);
+        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
+        let completions = generate_completions_for_type(content, position, &type_info, analyzer);
 
         // Should complete with variant fields
         assert!(!completions.is_empty());
@@ -657,9 +653,8 @@ mod tests {
         let content = "";
         let position = Position::new(0, 0);
 
-        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new(""));
-        let completions =
-            generate_completions_for_type(content, position, &type_info, analyzer);
+        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
+        let completions = generate_completions_for_type(content, position, &type_info, analyzer);
 
         // Should complete with variant names
         assert!(!completions.is_empty());

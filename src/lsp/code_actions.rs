@@ -1,5 +1,5 @@
-use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use super::tree_sitter_parser;
+use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use std::sync::Arc;
 use tower_lsp::Client;
 use tower_lsp::lsp_types::*;
@@ -222,8 +222,7 @@ async fn generate_missing_variant_field_actions(
                         && let Some(edit) = generate_field_insertions(&required_missing, content)
                     {
                         let mut changes = std::collections::HashMap::new();
-                        changes
-                            .insert(tower_lsp::lsp_types::Url::parse(uri).unwrap(), vec![edit]);
+                        changes.insert(tower_lsp::lsp_types::Url::parse(uri).unwrap(), vec![edit]);
 
                         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                             title: format!(
@@ -312,67 +311,67 @@ fn generate_missing_field_actions(
         if let Some(variant_name) = detect_current_variant_in_content(content)
             && let Some(variant) = variants.iter().find(|v| v.name == variant_name)
         {
-                // Generate actions for this variant's fields
-                let ron_fields = tree_sitter_parser::extract_fields_from_ron(content);
-                let all_missing: Vec<_> = variant
-                    .fields
-                    .iter()
-                    .filter(|field| !ron_fields.contains(&field.name))
-                    .collect();
+            // Generate actions for this variant's fields
+            let ron_fields = tree_sitter_parser::extract_fields_from_ron(content);
+            let all_missing: Vec<_> = variant
+                .fields
+                .iter()
+                .filter(|field| !ron_fields.contains(&field.name))
+                .collect();
 
-                let required_missing: Vec<_> = all_missing
-                    .iter()
-                    .filter(|&&field| !field.is_optional() && !type_info.has_default)
-                    .copied()
-                    .collect();
+            let required_missing: Vec<_> = all_missing
+                .iter()
+                .filter(|&&field| !field.is_optional() && !type_info.has_default)
+                .copied()
+                .collect();
 
-                // Code action: Add all required fields for variant
-                if !required_missing.is_empty()
-                    && let Some(edit) = generate_field_insertions(&required_missing, content)
-                {
-                    let mut changes = std::collections::HashMap::new();
-                    changes.insert(tower_lsp::lsp_types::Url::parse(uri).unwrap(), vec![edit]);
+            // Code action: Add all required fields for variant
+            if !required_missing.is_empty()
+                && let Some(edit) = generate_field_insertions(&required_missing, content)
+            {
+                let mut changes = std::collections::HashMap::new();
+                changes.insert(tower_lsp::lsp_types::Url::parse(uri).unwrap(), vec![edit]);
 
-                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                        title: format!(
-                            "Add {} required field{} to {}",
-                            required_missing.len(),
-                            if required_missing.len() == 1 { "" } else { "s" },
-                            variant_name
-                        ),
-                        kind: Some(CodeActionKind::QUICKFIX),
-                        edit: Some(WorkspaceEdit {
-                            changes: Some(changes),
-                            ..Default::default()
-                        }),
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!(
+                        "Add {} required field{} to {}",
+                        required_missing.len(),
+                        if required_missing.len() == 1 { "" } else { "s" },
+                        variant_name
+                    ),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
                         ..Default::default()
-                    }));
-                }
+                    }),
+                    ..Default::default()
+                }));
+            }
 
-                // Code action: Add all fields for variant
-                if !all_missing.is_empty()
-                    && let Some(edit) = generate_field_insertions(&all_missing, content)
-                {
-                    let mut changes = std::collections::HashMap::new();
-                    changes.insert(tower_lsp::lsp_types::Url::parse(uri).unwrap(), vec![edit]);
+            // Code action: Add all fields for variant
+            if !all_missing.is_empty()
+                && let Some(edit) = generate_field_insertions(&all_missing, content)
+            {
+                let mut changes = std::collections::HashMap::new();
+                changes.insert(tower_lsp::lsp_types::Url::parse(uri).unwrap(), vec![edit]);
 
-                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                        title: format!(
-                            "Add all {} missing field{} to {}",
-                            all_missing.len(),
-                            if all_missing.len() == 1 { "" } else { "s" },
-                            variant_name
-                        ),
-                        kind: Some(CodeActionKind::QUICKFIX),
-                        edit: Some(WorkspaceEdit {
-                            changes: Some(changes),
-                            ..Default::default()
-                        }),
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!(
+                        "Add all {} missing field{} to {}",
+                        all_missing.len(),
+                        if all_missing.len() == 1 { "" } else { "s" },
+                        variant_name
+                    ),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
                         ..Default::default()
-                    }));
-                }
+                    }),
+                    ..Default::default()
+                }));
+            }
 
-                return actions;
+            return actions;
         }
     }
 
@@ -511,12 +510,11 @@ fn create_explicit_field_type_action(
                     .last()
                     .unwrap_or(&field.type_name)
                     .replace(" ", "");
-                let clean_type =
-                    if type_name.starts_with("Option<") && type_name.ends_with('>') {
-                        &type_name[7..type_name.len() - 1]
-                    } else {
-                        &type_name
-                    };
+                let clean_type = if type_name.starts_with("Option<") && type_name.ends_with('>') {
+                    &type_name[7..type_name.len() - 1]
+                } else {
+                    &type_name
+                };
 
                 let pos = value_node.start_position();
                 let mut changes = std::collections::HashMap::new();
@@ -532,10 +530,7 @@ fn create_explicit_field_type_action(
                 );
 
                 return Some(CodeActionOrCommand::CodeAction(CodeAction {
-                    title: format!(
-                        "Make field type explicit: {} {}",
-                        field.name, clean_type
-                    ),
+                    title: format!("Make field type explicit: {} {}", field.name, clean_type),
                     kind: Some(CodeActionKind::REFACTOR),
                     edit: Some(WorkspaceEdit {
                         changes: Some(changes),
@@ -642,7 +637,9 @@ fn detect_current_variant_in_content(content: &str) -> Option<String> {
 
     // Find the variant name after ::
     let after_colons = &content[double_colon_idx + 2..];
-    let variant_start = after_colons.chars().position(|c| c.is_alphanumeric() || c == '_')?;
+    let variant_start = after_colons
+        .chars()
+        .position(|c| c.is_alphanumeric() || c == '_')?;
     let variant_part = &after_colons[variant_start..];
 
     // Extract the variant name (alphanumeric + underscore until opening paren/brace or whitespace)
@@ -655,9 +652,7 @@ fn detect_current_variant_in_content(content: &str) -> Option<String> {
 
     // Check that there's an opening paren or brace after the variant name (with optional whitespace)
     let remaining = variant_part[variant_end..].trim_start();
-    if (remaining.starts_with('(') || remaining.starts_with('{'))
-        && !variant_name.is_empty()
-    {
+    if (remaining.starts_with('(') || remaining.starts_with('{')) && !variant_name.is_empty() {
         return Some(variant_name.to_string());
     }
 
@@ -980,7 +975,7 @@ mod tests {
         use crate::rust_analyzer::RustAnalyzer;
         use std::sync::Arc;
 
-        let analyzer = Arc::new(RustAnalyzer::new(""));
+        let analyzer = Arc::new(RustAnalyzer::new());
         let (service, _) = tower_lsp::LspService::new(|client| crate::lsp::Backend {
             client: client.clone(),
             documents: Default::default(),
