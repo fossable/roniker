@@ -304,22 +304,32 @@ async fn validate_struct_fields(
     has_default: bool,
     analyzer: Option<&Arc<RustAnalyzer>>,
 ) -> Vec<Diagnostic> {
+    use super::ts_utils::{self, RonParser};
     let mut diagnostics = Vec::new();
 
-    // Extract fields from RON using proper parsing
-    let ron_fields = tree_sitter_parser::extract_fields_from_ron(content);
+    // The RON-parsed map is used for primitive type checking (it understands typed values).
+    let ron_map = parsed_value.as_ref().ok().and_then(extract_map_from_value);
 
-    // Check for unknown fields in RON using tree-sitter for position
-    use super::ts_utils::{self, RonParser};
+    // Single tree-sitter parse: drives unknown-field detection, field value node access
+    // (for custom-type validation via validate_field_value_node), position reporting,
+    // and missing-field detection — no re-parsing or string extraction required.
     let mut parser = RonParser::new();
-    if let Some(tree) = parser.parse(content)
-        && let Some(main_value) = ts_utils::find_main_value(&tree)
-            && main_value.kind() == "struct" {
-                let field_nodes = ts_utils::struct_fields(&main_value);
-                for field_node in field_nodes {
-                    if let Some(field_name) = ts_utils::field_name(&field_node, content)
-                        && !fields.iter().any(|f| f.name == field_name) {
-                            let range = ts_utils::node_to_lsp_range(&field_node.child(0).unwrap());
+    if let Some(tree) = parser.parse(content) {
+        if let Some(main_value) = ts_utils::find_main_value(&tree) {
+            if main_value.kind() == "struct" {
+                let mut present_field_names: Vec<&str> = Vec::new();
+                let struct_field_nodes = ts_utils::struct_fields(&main_value);
+
+                for field_node in struct_field_nodes {
+                    let Some(field_name) = ts_utils::field_name(&field_node, content) else {
+                        continue;
+                    };
+
+                    match fields.iter().find(|f| f.name == field_name) {
+                        None => {
+                            // Unknown field — report at the field name node
+                            let range =
+                                ts_utils::node_to_lsp_range(&field_node.child(0).unwrap());
                             diagnostics.push(Diagnostic {
                                 range,
                                 severity: Some(DiagnosticSeverity::ERROR),
@@ -327,118 +337,162 @@ async fn validate_struct_fields(
                                 ..Default::default()
                             });
                         }
-                }
-            }
+                        Some(field_info) => {
+                            present_field_names.push(field_name);
 
-    // Type check each field if we successfully parsed the RON
-    if let Ok(value) = parsed_value {
-        // For named structs like MyStruct(...), the value might be wrapped
-        let map = extract_map_from_value(value);
+                            let Some(value_node) = ts_utils::field_value(&field_node) else {
+                                continue;
+                            };
 
-        if let Some(map) = map {
-            // Pre-compute field positions and contents in a single pass
-            let mut field_positions = std::collections::HashMap::new();
-            let mut field_contents = std::collections::HashMap::new();
-
-            for field in fields {
-                if let Some(pos) = find_field_value_position(content, &field.name) {
-                    field_positions.insert(field.name.clone(), pos);
-                }
-                if let Some(content_str) = extract_field_value_text(content, &field.name) {
-                    field_contents.insert(field.name.clone(), content_str);
-                }
-            }
-
-            for field in fields {
-                if let Some(field_value) = map.get(&Value::String(field.name.clone())) {
-                    // For custom types (structs/enums), recursively validate
-                    if let Some(analyzer) = analyzer
-                        && !is_primitive_type(&field.type_name)
-                            && !is_std_generic_type(&field.type_name)
-                            && let Some(nested_type_info) =
-                                analyzer.get_type_info(&field.type_name).cloned()
-                            {
-                                // Use pre-extracted position and content
-                                if let Some(&(line_num, _, _)) = field_positions.get(&field.name)
-                                    && let Some(field_content) = field_contents.get(&field.name) {
-                                        let mut nested_diags =
-                                            Box::pin(validate_ron_with_analyzer(
-                                                field_content,
-                                                &nested_type_info,
-                                                analyzer.clone(),
-                                            ))
-                                            .await;
-                                        // Adjust line numbers to match the original file
-                                        nested_diags = adjust_diagnostic_positions(
-                                            nested_diags,
-                                            line_num as u32,
-                                        );
-                                        diagnostics.extend(nested_diags);
-                                        continue; // Skip type checking since we did full validation
-                                    }
+                            // Deep validation: Vec<T>, Option<T>, plain custom structs/enums.
+                            // validate_field_value_node handles all generic-wrapper cases
+                            // uniformly, so there are no per-container special cases here.
+                            if let Some(analyzer) = analyzer {
+                                let deep_diags = Box::pin(validate_field_value_node(
+                                    &value_node,
+                                    content,
+                                    &field_info.type_name,
+                                    analyzer,
+                                ))
+                                .await;
+                                if !deep_diags.is_empty() {
+                                    diagnostics.extend(deep_diags);
+                                    continue; // skip primitive check for this field
+                                }
                             }
 
-                    // Check type - with enum validation if analyzer is available
-                    let type_mismatch = if let Some(analyzer) = analyzer {
-                        check_type_mismatch_with_enum_validation(
-                            field_value,
-                            &field.type_name,
-                            content,
-                            &field.name,
-                            analyzer,
-                        )
-                        .await
-                    } else {
-                        check_type_mismatch_deep(
-                            field_value,
-                            &field.type_name,
-                            content,
-                            &field.name,
-                        )
-                    };
-
-                    if let Some(error_msg) = type_mismatch {
-                        // Use pre-computed position
-                        if let Some(&(line_num, col_start, col_end)) =
-                            field_positions.get(&field.name)
-                        {
-                            diagnostics.push(Diagnostic {
-                                range: Range::new(
-                                    Position::new(line_num as u32, col_start as u32),
-                                    Position::new(line_num as u32, col_end as u32),
-                                ),
-                                severity: Some(DiagnosticSeverity::ERROR),
-                                message: format!("Type mismatch: {}", error_msg),
-                                ..Default::default()
-                            });
+                            // Primitive / surface-level type check (uses RON-parsed typed values).
+                            // Positions come directly from the tree-sitter node — no line adjustment.
+                            if let Some(ref map) = ron_map {
+                                if let Some(field_value) =
+                                    map.get(&Value::String(field_name.to_string()))
+                                {
+                                    let type_mismatch = if let Some(analyzer) = analyzer {
+                                        check_type_mismatch_with_enum_validation(
+                                            field_value,
+                                            &field_info.type_name,
+                                            content,
+                                            field_name,
+                                            analyzer,
+                                        )
+                                        .await
+                                    } else {
+                                        check_type_mismatch_deep(
+                                            field_value,
+                                            &field_info.type_name,
+                                            content,
+                                            field_name,
+                                        )
+                                    };
+                                    if let Some(error_msg) = type_mismatch {
+                                        let pos = value_node.start_position();
+                                        let end_pos = value_node.end_position();
+                                        // For multi-line nodes, use end of first line
+                                        // to avoid inverted column ranges
+                                        let end_col = if end_pos.row > pos.row {
+                                            let line =
+                                                content.lines().nth(pos.row).unwrap_or("");
+                                            line.len() as u32
+                                        } else {
+                                            end_pos.column as u32
+                                        };
+                                        diagnostics.push(Diagnostic {
+                                            range: Range::new(
+                                                Position::new(pos.row as u32, pos.column as u32),
+                                                Position::new(pos.row as u32, end_col),
+                                            ),
+                                            severity: Some(DiagnosticSeverity::ERROR),
+                                            message: format!("Type mismatch: {}", error_msg),
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
+                            }
                         }
+                    }
+                }
+
+                // Missing required fields: compare expected fields against those we saw above.
+                if !has_default {
+                    let missing_fields: Vec<_> = fields
+                        .iter()
+                        .filter(|f| {
+                            !present_field_names.contains(&f.name.as_str()) && !f.is_optional()
+                        })
+                        .collect();
+                    if !missing_fields.is_empty() {
+                        let missing_names: Vec<String> =
+                            missing_fields.iter().map(|f| f.name.clone()).collect();
+                        let (line, col_start, col_end) = find_struct_name_position(content);
+                        diagnostics.push(Diagnostic {
+                            range: Range::new(
+                                Position::new(line, col_start),
+                                Position::new(line, col_end),
+                            ),
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            message: format!("Required fields: {}", missing_names.join(", ")),
+                            ..Default::default()
+                        });
                     }
                 }
             }
         }
     }
 
-    // Check for missing required fields
-    // Fields are required if they are not Option<T> and the struct doesn't have Default
-    if !has_default {
-        let missing_fields: Vec<_> = fields
-            .iter()
-            .filter(|field| !ron_fields.contains(&field.name) && !field.is_optional())
-            .collect();
+    diagnostics
+}
 
-        if !missing_fields.is_empty() {
-            let missing_names: Vec<String> =
-                missing_fields.iter().map(|f| f.name.clone()).collect();
+/// Validate a single field's value node against its declared Rust type.
+///
+/// This is the single place that decides how to recurse into generic wrappers
+/// (Vec<T>, Option<T>, …) and plain custom types. Both `validate_struct_fields`
+/// and `validate_node_with_type_info` delegate here so the logic isn't duplicated.
+async fn validate_field_value_node<'a>(
+    value_node: &tree_sitter::Node<'a>,
+    content: &str,
+    field_type: &str,
+    analyzer: &Arc<RustAnalyzer>,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let field_type_normalized = field_type.replace(" ", "");
 
-            // Find the struct name position in the content
-            let (line, col_start, col_end) = find_struct_name_position(content);
-
-            diagnostics.push(Diagnostic {
-                range: Range::new(Position::new(line, col_start), Position::new(line, col_end)),
-                severity: Some(DiagnosticSeverity::ERROR),
-                message: format!("Required fields: {}", missing_names.join(", ")),
-                ..Default::default()
-            });
+    if let Some(inner_type) = extract_inner_type(&field_type_normalized, "Vec<") {
+        // Vec<CustomType> — validate every array element against the inner type
+        if !is_primitive_type(&inner_type) && !is_std_generic_type(&inner_type) {
+            if let Some(inner_type_info) = analyzer.get_type_info(&inner_type).cloned() {
+                if value_node.kind() == "array" {
+                    let mut cursor = value_node.walk();
+                    for elem_node in value_node.children(&mut cursor) {
+                        if elem_node.kind() != "["
+                            && elem_node.kind() != "]"
+                            && elem_node.kind() != ","
+                        {
+                            let elem_diags = Box::pin(validate_node_with_type_info(
+                                &elem_node,
+                                content,
+                                &inner_type_info,
+                                analyzer,
+                            ))
+                            .await;
+                            diagnostics.extend(elem_diags);
+                        }
+                    }
+                }
+            }
+        }
+    } else if !is_primitive_type(&field_type_normalized)
+        && !is_std_generic_type(&field_type_normalized)
+    {
+        // Plain custom struct/enum — validate the node directly
+        if let Some(nested_type_info) = analyzer.get_type_info(field_type).cloned() {
+            let nested_diags = Box::pin(validate_node_with_type_info(
+                value_node,
+                content,
+                &nested_type_info,
+                analyzer,
+            ))
+            .await;
+            diagnostics.extend(nested_diags);
         }
     }
 
@@ -531,54 +585,16 @@ async fn validate_node_with_type_info<'a>(
 
                         // Check if field exists in type
                         if let Some(field_info) = fields.iter().find(|f| f.name == field_name) {
-                            // Validate field value recursively if it's a custom type
+                            // Delegate to the shared helper for all generic-wrapper and custom types
                             if let Some(value_node) = ts_utils::field_value(&field_node) {
-                                let field_type_normalized = field_info.type_name.replace(" ", "");
-
-                                // Handle Vec<CustomType>
-                                if let Some(inner_type) =
-                                    extract_inner_type(&field_type_normalized, "Vec<")
-                                {
-                                    if !is_primitive_type(&inner_type)
-                                        && !is_std_generic_type(&inner_type)
-                                        && let Some(inner_type_info) =
-                                            analyzer.get_type_info(&inner_type).cloned()
-                                            && value_node.kind() == "array" {
-                                                let mut cursor = value_node.walk();
-                                                for elem_node in value_node.children(&mut cursor) {
-                                                    if elem_node.kind() != "["
-                                                        && elem_node.kind() != "]"
-                                                        && elem_node.kind() != ","
-                                                    {
-                                                        let elem_diags =
-                                                            Box::pin(validate_node_with_type_info(
-                                                                &elem_node,
-                                                                content,
-                                                                &inner_type_info,
-                                                                analyzer,
-                                                            ))
-                                                            .await;
-                                                        diagnostics.extend(elem_diags);
-                                                    }
-                                                }
-                                            }
-                                } else if !is_primitive_type(&field_type_normalized)
-                                    && !is_std_generic_type(&field_type_normalized)
-                                {
-                                    // Custom non-generic type - validate recursively
-                                    if let Some(nested_type_info) =
-                                        analyzer.get_type_info(&field_info.type_name).cloned()
-                                    {
-                                        let nested_diags = Box::pin(validate_node_with_type_info(
-                                            &value_node,
-                                            content,
-                                            &nested_type_info,
-                                            analyzer,
-                                        ))
-                                        .await;
-                                        diagnostics.extend(nested_diags);
-                                    }
-                                }
+                                let field_diags = Box::pin(validate_field_value_node(
+                                    &value_node,
+                                    content,
+                                    &field_info.type_name,
+                                    analyzer,
+                                ))
+                                .await;
+                                diagnostics.extend(field_diags);
                             }
                         } else {
                             // Unknown field
