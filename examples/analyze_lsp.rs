@@ -31,5 +31,5 @@ fn main() {
     // Start the LSP server
     tokio::runtime::Runtime::new()
         .expect("Failed to create Tokio runtime")
-        .block_on(roniker::serve(analyzer));
+        .block_on(roniker::serve(analyzer, true));
 }

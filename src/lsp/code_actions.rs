@@ -980,6 +980,7 @@ mod tests {
             client: client.clone(),
             documents: Default::default(),
             rust_analyzer: analyzer.clone(),
+            info_diagnostics: true,
         });
         let client = service.inner().client.clone();
 

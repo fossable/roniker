@@ -316,6 +316,11 @@ async fn validate_struct_fields(
     // Single tree-sitter parse: drives unknown-field detection, field value node access
     // (for custom-type validation via validate_field_value_node), position reporting,
     // and missing-field detection — no re-parsing or string extraction required.
+    // Tuple/newtype structs have numeric field names ("0", "1", ...) — skip named-field validation
+    if fields.iter().all(|f| f.name.parse::<usize>().is_ok()) {
+        return diagnostics;
+    }
+
     let mut parser = RonParser::new();
     if let Some(tree) = parser.parse(content)
         && let Some(main_value) = ts_utils::find_main_value(&tree)
@@ -344,22 +349,24 @@ async fn validate_struct_fields(
                     Some(field_info) => {
                         present_field_names.push(field_name);
 
-                        // Emit an info diagnostic at the field name showing its type
-                        let field_name_range =
-                            ts_utils::node_to_lsp_range(&field_node.child(0).unwrap());
-                        diagnostics.push(Diagnostic {
-                            range: field_name_range,
-                            severity: Some(DiagnosticSeverity::INFORMATION),
-                            message: format!(
-                                "{}: {}",
-                                field_info.name, field_info.type_name
-                            ),
-                            ..Default::default()
-                        });
-
                         let Some(value_node) = ts_utils::field_value(&field_node) else {
                             continue;
                         };
+
+                        // Emit an info diagnostic only if the type isn't already named in the RON
+                        let type_named_in_file = ts_utils::struct_name(&value_node, content)
+                            .is_some()
+                            || value_node.kind() == "identifier";
+                        if !type_named_in_file {
+                            let field_name_range =
+                                ts_utils::node_to_lsp_range(&field_node.child(0).unwrap());
+                            diagnostics.push(Diagnostic {
+                                range: field_name_range,
+                                severity: Some(DiagnosticSeverity::INFORMATION),
+                                message: format!("{}: {}", field_info.name, field_info.type_name),
+                                ..Default::default()
+                            });
+                        }
 
                         // Deep validation: Vec<T>, Option<T>, plain custom structs/enums.
                         // validate_field_value_node handles all generic-wrapper cases
@@ -468,6 +475,21 @@ async fn validate_field_value_node<'a>(
     let mut diagnostics = Vec::new();
     let field_type_normalized = field_type.replace(" ", "");
 
+    // Helper closure to emit an "Unknown type" diagnostic at the value node
+    let unknown_type_diag = |inner: &str| {
+        let start = value_node.start_position();
+        let end = value_node.end_position();
+        Diagnostic {
+            range: Range::new(
+                Position::new(start.row as u32, start.column as u32),
+                Position::new(end.row as u32, end.column as u32),
+            ),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: format!("Unknown type '{}'", inner),
+            ..Default::default()
+        }
+    };
+
     if let Some(inner_type) = extract_inner_type(&field_type_normalized, "Vec<") {
         // Vec<CustomType> — validate every array element against the inner type
         if !is_primitive_type(&inner_type) && !is_std_generic_type(&inner_type) {
@@ -491,21 +513,26 @@ async fn validate_field_value_node<'a>(
                     }
                 }
             } else {
-                // Unknown inner type — report an error at the value node
-                let range = {
-                    let start = value_node.start_position();
-                    let end = value_node.end_position();
-                    Range::new(
-                        Position::new(start.row as u32, start.column as u32),
-                        Position::new(end.row as u32, end.column as u32),
-                    )
-                };
-                diagnostics.push(Diagnostic {
-                    range,
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    message: format!("Unknown type '{}'", inner_type),
-                    ..Default::default()
-                });
+                diagnostics.push(unknown_type_diag(&inner_type));
+            }
+        }
+    } else if let Some(inner_type) = ["Option<", "Box<", "Arc<", "Rc<"]
+        .iter()
+        .find_map(|w| extract_inner_type(&field_type_normalized, w))
+    {
+        // Single-element wrapper — check the inner type is known
+        if !is_primitive_type(&inner_type) && !is_std_generic_type(&inner_type) {
+            if let Some(inner_type_info) = analyzer.get_type_info(&inner_type).cloned() {
+                let nested_diags = Box::pin(validate_node_with_type_info(
+                    value_node,
+                    content,
+                    &inner_type_info,
+                    analyzer,
+                ))
+                .await;
+                diagnostics.extend(nested_diags);
+            } else {
+                diagnostics.push(unknown_type_diag(&inner_type));
             }
         }
     } else if !is_primitive_type(&field_type_normalized)
@@ -617,6 +644,11 @@ async fn validate_node_with_type_info<'a>(
 
     match &type_info.kind {
         TypeKind::Struct(fields) => {
+            // Tuple/newtype structs have numeric field names — skip named-field validation
+            if fields.iter().all(|f| f.name.parse::<usize>().is_ok()) {
+                return diagnostics;
+            }
+
             // Validate struct fields
             if node.kind() == "struct" {
                 let field_nodes = ts_utils::struct_fields(node);
@@ -978,20 +1010,17 @@ async fn check_type_mismatch_with_enum_validation(
         // Extract the type/variant name from the RON text
         let type_in_ron = trimmed.split('(').next().unwrap_or(trimmed).trim();
 
-        // Skip empty or primitive-looking values
-        if !type_in_ron.is_empty()
-            && type_in_ron
-                .chars()
-                .next()
-                .map(|c| c.is_uppercase())
-                .unwrap_or(false)
-            && !is_primitive_type(type_in_ron)
-        {
-            // Check if the expected type is known
+        // Check if the expected type is a known enum first — if so, validate the variant name
+        // regardless of case (serde rename_all can produce lowercase/snake_case variant names)
+        if !type_in_ron.is_empty() && !is_primitive_type(type_in_ron) {
             if let Some(type_info) = analyzer.get_type_info(expected_type).cloned() {
                 if let TypeKind::Enum(variants) = &type_info.kind {
-                    // For enum fields, check if this is a valid variant
-                    if !variants.iter().any(|v| v.name == type_in_ron) {
+                    // For enum fields, check if this is a valid variant (case-insensitive to
+                    // handle serde rename_all = "snake_case" etc.)
+                    let variant_match = variants.iter().any(|v| {
+                        v.name == type_in_ron || v.name.to_lowercase() == type_in_ron.to_lowercase()
+                    });
+                    if !variant_match {
                         return Some(format!(
                             "unknown variant '{}' for enum {}",
                             type_in_ron, expected_type
@@ -999,7 +1028,12 @@ async fn check_type_mismatch_with_enum_validation(
                     }
                     // Valid enum variant - no error
                     return None;
-                } else {
+                } else if type_in_ron
+                    .chars()
+                    .next()
+                    .map(|c| c.is_uppercase())
+                    .unwrap_or(false)
+                {
                     // Expected type is a struct - the name in RON should match or be unnamed
                     let expected_simple = expected_type.split("::").last().unwrap_or(expected_type);
                     if type_in_ron != expected_simple {
@@ -1555,10 +1589,9 @@ mod tests {
             "Should error on primitive when expecting struct"
         );
         assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)
-                    && d.message.contains("User")),
+            diagnostics.iter().any(
+                |d| d.severity == Some(DiagnosticSeverity::ERROR) && d.message.contains("User")
+            ),
             "Should complain about User type. Got: {:?}",
             diagnostics
         );
@@ -1570,10 +1603,9 @@ mod tests {
         )"#;
         let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
         assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)
-                    && d.message.contains("User")),
+            diagnostics.iter().any(
+                |d| d.severity == Some(DiagnosticSeverity::ERROR) && d.message.contains("User")
+            ),
             "Should error on unknown type 'User'. Got: {:?}",
             diagnostics
         );

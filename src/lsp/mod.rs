@@ -27,14 +27,16 @@ pub struct Backend {
     pub client: Client,
     pub documents: Arc<RwLock<HashMap<String, Document>>>,
     pub rust_analyzer: Arc<rust_analyzer::RustAnalyzer>,
+    pub info_diagnostics: bool,
 }
 
 impl Backend {
-    pub fn new(client: Client, analyzer: RustAnalyzer) -> Self {
+    pub fn new(client: Client, analyzer: RustAnalyzer, info_diagnostics: bool) -> Self {
         Self {
             client,
             documents: Arc::new(RwLock::new(HashMap::new())),
             rust_analyzer: Arc::new(analyzer),
+            info_diagnostics,
         }
     }
 
@@ -214,8 +216,8 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, format!("Word at position: {}", word))
             .await;
 
-        // Use shared navigation helper if root type is set
-        let current_type_info = if let Some(type_path) = &self.rust_analyzer.root_type {
+        // Use shared navigation helper, falling back to inferring type from RON struct name
+        let current_type_info = if let Some(type_path) = self.resolve_root_type_path(&content) {
             self.client
                 .log_message(MessageType::INFO, format!("Type annotation: {}", type_path))
                 .await;
@@ -227,7 +229,7 @@ impl LanguageServer for Backend {
                     format!("Found {} type contexts", contexts.len()),
                 )
                 .await;
-            self.navigate_to_innermost_type(type_path, &contexts).await
+            self.navigate_to_innermost_type(&type_path, &contexts).await
         } else {
             None
         };
@@ -465,10 +467,10 @@ impl LanguageServer for Backend {
         };
 
         {
-            // Use shared navigation helper if root type is set
-            let current_type_info = if let Some(type_path) = &self.rust_analyzer.root_type {
+            // Use shared navigation helper, falling back to inferring type from RON struct name
+            let current_type_info = if let Some(type_path) = self.resolve_root_type_path(&content) {
                 let contexts = self.get_type_contexts(&uri, position, &content).await;
-                self.navigate_to_innermost_type(type_path, &contexts).await
+                self.navigate_to_innermost_type(&type_path, &contexts).await
             } else {
                 None
             };
@@ -642,10 +644,10 @@ impl LanguageServer for Backend {
             }
         };
 
-        // Navigate to innermost type using shared helper if root type is set
-        let current_type_info = if let Some(type_path) = &self.rust_analyzer.root_type {
+        // Navigate to innermost type using shared helper, falling back to inferring from RON struct name
+        let current_type_info = if let Some(type_path) = self.resolve_root_type_path(&content) {
             let contexts = self.get_type_contexts(&uri, position, &content).await;
-            self.navigate_to_innermost_type(type_path, &contexts).await
+            self.navigate_to_innermost_type(&type_path, &contexts).await
         } else {
             None
         };
@@ -687,12 +689,7 @@ impl LanguageServer for Backend {
             }
         };
 
-        if let Some(type_path) = &self.rust_analyzer.root_type {
-            self.client
-                .log_message(MessageType::INFO, format!("Root type: {}", type_path))
-                .await;
-        }
-        if let Some(type_info) = self.rust_analyzer.root_type_info().cloned() {
+        if let Some(type_info) = self.resolve_root_type_info(&content) {
             self.client
                 .log_message(
                     MessageType::INFO,
@@ -735,8 +732,13 @@ impl LanguageServer for Backend {
             let formatted = Backend::format_ron(&doc.content);
 
             if formatted != doc.content {
+                let line_count = doc.content.lines().count() as u32;
+                let last_line_len = doc.content.lines().last().map_or(0, |l| l.len()) as u32;
                 return Ok(Some(vec![TextEdit {
-                    range: Range::new(Position::new(0, 0), Position::new(u32::MAX, u32::MAX)),
+                    range: Range::new(
+                        Position::new(0, 0),
+                        Position::new(line_count.saturating_sub(1), last_line_len),
+                    ),
                     new_text: formatted,
                 }]));
             }
@@ -930,6 +932,35 @@ impl Backend {
         format::format_ron(content)
     }
 
+    /// Resolve the root TypeInfo for a document, either from the configured root type
+    /// or by inferring it from the struct name at the top of the RON content.
+    fn resolve_root_type_info(&self, content: &str) -> Option<rust_analyzer::TypeInfo> {
+        self.rust_analyzer.root_type_info().cloned().or_else(|| {
+            use super::lsp::ts_utils::{self, RonParser};
+            let mut parser = RonParser::new();
+            let tree = parser.parse(content)?;
+            let main_value = ts_utils::find_main_value(&tree)?;
+            let name = ts_utils::struct_name(&main_value, content)?;
+            self.rust_analyzer.get_type_info(name).cloned()
+        })
+    }
+
+    /// Resolve the top-level type path for a document, either from the configured root type
+    /// or by inferring it from the struct name at the top of the RON content.
+    fn resolve_root_type_path<'a>(&'a self, content: &'a str) -> Option<std::borrow::Cow<'a, str>> {
+        if let Some(path) = &self.rust_analyzer.root_type {
+            return Some(std::borrow::Cow::Borrowed(path.as_str()));
+        }
+        use super::lsp::ts_utils::{self, RonParser};
+        let mut parser = RonParser::new();
+        let tree = parser.parse(content)?;
+        let main_value = ts_utils::find_main_value(&tree)?;
+        let name = ts_utils::struct_name(&main_value, content)?;
+        // Verify the name is actually registered before returning it
+        self.rust_analyzer.get_type_info(name)?;
+        Some(std::borrow::Cow::Owned(name.to_string()))
+    }
+
     /// Navigate through nested type contexts to find the innermost type
     /// This is used by goto_definition, hover, and completion
     async fn navigate_to_innermost_type(
@@ -1083,7 +1114,9 @@ impl Backend {
             )
             .await;
 
-        let diagnostics = if let Some(type_info) = self.rust_analyzer.root_type_info().cloned() {
+        let type_info = self.resolve_root_type_info(content);
+
+        let diagnostics = if let Some(type_info) = type_info {
             self.client
                 .log_message(
                     MessageType::INFO,
@@ -1107,6 +1140,15 @@ impl Backend {
             vec![]
         };
 
+        let diagnostics: Vec<_> = if self.info_diagnostics {
+            diagnostics
+        } else {
+            diagnostics
+                .into_iter()
+                .filter(|d| d.severity != Some(DiagnosticSeverity::INFORMATION))
+                .collect()
+        };
+
         self.client
             .log_message(
                 MessageType::INFO,
@@ -1126,7 +1168,7 @@ mod tests {
 
     /// Helper to create a test Backend with a pre-configured analyzer
     async fn create_test_backend_with_analyzer(analyzer: RustAnalyzer) -> Backend {
-        let (service, _) = LspService::new(|client| Backend::new(client, analyzer));
+        let (service, _) = LspService::new(|client| Backend::new(client, analyzer, true));
         service.inner().clone()
     }
 
@@ -1136,6 +1178,7 @@ mod tests {
                 client: self.client.clone(),
                 documents: self.documents.clone(),
                 rust_analyzer: self.rust_analyzer.clone(),
+                info_diagnostics: self.info_diagnostics,
             }
         }
     }
@@ -1828,10 +1871,11 @@ PostReference(
 }
 
 /// Run the LSP server on stdin/stdout for the given analyzer.
-pub async fn serve(analyzer: RustAnalyzer) {
+pub async fn serve(analyzer: RustAnalyzer, info_diagnostics: bool) {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| Backend::new(client, analyzer));
+    let (service, socket) =
+        LspService::new(|client| Backend::new(client, analyzer, info_diagnostics));
     Server::new(stdin, stdout, socket).serve(service).await;
 }
