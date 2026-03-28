@@ -1,6 +1,5 @@
 mod code_actions;
 mod completion;
-mod diagnostic_reporter;
 mod diagnostics;
 mod format;
 mod tree_sitter_parser;

@@ -59,38 +59,6 @@ fn get_completion_context(content: &str, position: Position) -> CompletionContex
     CompletionContext::FieldName
 }
 
-/// Find the type we're currently inside (e.g., if typing "User(" we return "User")
-#[allow(dead_code)]
-fn find_current_type_context(content: &str, position: Position) -> Option<String> {
-    let lines: Vec<&str> = content.lines().collect();
-
-    if position.line as usize >= lines.len() {
-        return None;
-    }
-
-    let line = lines[position.line as usize];
-    let col = position.character as usize;
-    let before_cursor = &line[..col.min(line.len())];
-
-    // Look for pattern like "TypeName(" right before cursor
-    // This handles cases like: author: User(
-    if let Some(paren_pos) = before_cursor.rfind('(') {
-        let before_paren = before_cursor[..paren_pos].trim();
-
-        // Extract the type name (last word before the paren)
-        if let Some(word_start) = before_paren.rfind(|c: char| !c.is_alphanumeric() && c != '_') {
-            let type_name = &before_paren[word_start + 1..];
-            if !type_name.is_empty() && type_name.chars().next().unwrap().is_uppercase() {
-                return Some(type_name.to_string());
-            }
-        } else if !before_paren.is_empty() && before_paren.chars().next().unwrap().is_uppercase() {
-            return Some(before_paren.to_string());
-        }
-    }
-
-    None
-}
-
 /// Generate completions for a given type (already navigated to the innermost type)
 /// Type context navigation is now done in main.rs using Backend::navigate_to_innermost_type
 pub fn generate_completions_for_type(

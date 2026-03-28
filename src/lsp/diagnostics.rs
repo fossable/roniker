@@ -344,6 +344,19 @@ async fn validate_struct_fields(
                     Some(field_info) => {
                         present_field_names.push(field_name);
 
+                        // Emit an info diagnostic at the field name showing its type
+                        let field_name_range =
+                            ts_utils::node_to_lsp_range(&field_node.child(0).unwrap());
+                        diagnostics.push(Diagnostic {
+                            range: field_name_range,
+                            severity: Some(DiagnosticSeverity::INFORMATION),
+                            message: format!(
+                                "{}: {}",
+                                field_info.name, field_info.type_name
+                            ),
+                            ..Default::default()
+                        });
+
                         let Some(value_node) = ts_utils::field_value(&field_node) else {
                             continue;
                         };
@@ -457,23 +470,42 @@ async fn validate_field_value_node<'a>(
 
     if let Some(inner_type) = extract_inner_type(&field_type_normalized, "Vec<") {
         // Vec<CustomType> — validate every array element against the inner type
-        if !is_primitive_type(&inner_type)
-            && !is_std_generic_type(&inner_type)
-            && let Some(inner_type_info) = analyzer.get_type_info(&inner_type).cloned()
-            && value_node.kind() == "array"
-        {
-            let mut cursor = value_node.walk();
-            for elem_node in value_node.children(&mut cursor) {
-                if elem_node.kind() != "[" && elem_node.kind() != "]" && elem_node.kind() != "," {
-                    let elem_diags = Box::pin(validate_node_with_type_info(
-                        &elem_node,
-                        content,
-                        &inner_type_info,
-                        analyzer,
-                    ))
-                    .await;
-                    diagnostics.extend(elem_diags);
+        if !is_primitive_type(&inner_type) && !is_std_generic_type(&inner_type) {
+            if let Some(inner_type_info) = analyzer.get_type_info(&inner_type).cloned() {
+                if value_node.kind() == "array" {
+                    let mut cursor = value_node.walk();
+                    for elem_node in value_node.children(&mut cursor) {
+                        if elem_node.kind() != "["
+                            && elem_node.kind() != "]"
+                            && elem_node.kind() != ","
+                        {
+                            let elem_diags = Box::pin(validate_node_with_type_info(
+                                &elem_node,
+                                content,
+                                &inner_type_info,
+                                analyzer,
+                            ))
+                            .await;
+                            diagnostics.extend(elem_diags);
+                        }
+                    }
                 }
+            } else {
+                // Unknown inner type — report an error at the value node
+                let range = {
+                    let start = value_node.start_position();
+                    let end = value_node.end_position();
+                    Range::new(
+                        Position::new(start.row as u32, start.column as u32),
+                        Position::new(end.row as u32, end.column as u32),
+                    )
+                };
+                diagnostics.push(Diagnostic {
+                    range,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: format!("Unknown type '{}'", inner_type),
+                    ..Default::default()
+                });
             }
         }
     } else if !is_primitive_type(&field_type_normalized)
@@ -489,6 +521,22 @@ async fn validate_field_value_node<'a>(
             ))
             .await;
             diagnostics.extend(nested_diags);
+        } else {
+            // Unknown custom type — report an error at the value node
+            let range = {
+                let start = value_node.start_position();
+                let end = value_node.end_position();
+                Range::new(
+                    Position::new(start.row as u32, start.column as u32),
+                    Position::new(end.row as u32, end.column as u32),
+                )
+            };
+            diagnostics.push(Diagnostic {
+                range,
+                severity: Some(DiagnosticSeverity::ERROR),
+                message: format!("Unknown type '{}'", field_type_normalized),
+                ..Default::default()
+            });
         }
     }
 
@@ -887,27 +935,6 @@ fn extract_enum_variant_from_text(content: &str) -> Option<ParsedEnumVariant> {
     ts_utils::extract_enum_variant(&main_value, ron_content)
 }
 
-/// Find the position of an enum variant in the content using tree-sitter
-#[allow(dead_code)]
-fn find_variant_position(content: &str, variant: &str) -> (u32, u32) {
-    use super::ts_utils::{self, RonParser};
-
-    let mut parser = RonParser::new();
-    if let Some(tree) = parser.parse(content) {
-        let variants = ts_utils::find_potential_variants(&tree, content);
-        for v in variants {
-            if let Some(text) = ts_utils::node_text(&v, content)
-                && text == variant
-            {
-                let pos = v.start_position();
-                return (pos.row as u32, pos.column as u32);
-            }
-        }
-    }
-
-    (0, 0)
-}
-
 /// Find the position of the struct name in the RON content using tree-sitter
 /// Returns (line, col_start, col_end) where col_start == col_end indicates unnamed struct
 fn find_struct_name_position(content: &str) -> (u32, u32, u32) {
@@ -931,33 +958,6 @@ fn find_struct_name_position(content: &str) -> (u32, u32, u32) {
     }
 
     (0, 0, 1)
-}
-
-/// Find the position of a field's value in the content using tree-sitter
-#[allow(dead_code)]
-fn find_field_value_position(content: &str, field_name: &str) -> Option<(usize, usize, usize)> {
-    use super::ts_utils::{self, RonParser};
-
-    let mut parser = RonParser::new();
-    let tree = parser.parse(content)?;
-
-    if let Some(main_value) = ts_utils::find_main_value(&tree)
-        && main_value.kind() == "struct"
-    {
-        let fields = ts_utils::struct_fields(&main_value);
-        for field in fields {
-            if let Some(name) = ts_utils::field_name(&field, content)
-                && name == field_name
-                && let Some(value_node) = ts_utils::field_value(&field)
-            {
-                let pos = value_node.start_position();
-                let end_pos = value_node.end_position();
-                return Some((pos.row, pos.column, end_pos.column));
-            }
-        }
-    }
-
-    None
 }
 
 /// Type checking with enum variant validation (async, uses analyzer)
@@ -1282,33 +1282,6 @@ fn extract_inner_type(type_str: &str, wrapper: &str) -> Option<String> {
     None
 }
 
-/// Basic RON syntax validation with better error positioning
-#[allow(dead_code)]
-pub fn validate_ron_syntax(content: &str) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
-
-    // Try to parse as RON
-    if let Err(e) = ron::from_str::<ron::Value>(content) {
-        let error_msg = e.to_string();
-
-        // Try to extract line and column from error message
-        // RON errors often contain "at line X column Y" or similar patterns
-        let (line, col) = parse_error_position(&error_msg, content);
-
-        // Create a more helpful error message
-        let simplified_msg = simplify_ron_error(&error_msg);
-
-        diagnostics.push(Diagnostic {
-            range: Range::new(Position::new(line, col), Position::new(line, col + 1)),
-            severity: Some(DiagnosticSeverity::ERROR),
-            message: simplified_msg,
-            ..Default::default()
-        });
-    }
-
-    diagnostics
-}
-
 /// Parse error position from RON error message
 fn parse_error_position(error_msg: &str, content: &str) -> (u32, u32) {
     // RON error messages often contain position info like "1:5" or "line 1 column 5"
@@ -1524,17 +1497,19 @@ mod tests {
             has_default: false,
         };
 
-        // Valid struct with enum field
+        // PostType is not registered with the analyzer, so it should produce an error
         let content = r#"Post(
             id: 1,
             title: "Test",
             post_type: Long,
         )"#;
         let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
-        assert_eq!(
-            diagnostics.len(),
-            0,
-            "Should have no errors. Got: {:?}",
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)
+                    && d.message.contains("PostType")),
+            "Should error on unknown type 'PostType'. Got: {:?}",
             diagnostics
         );
     }
@@ -1582,22 +1557,66 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message.contains("expected User")),
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)
+                    && d.message.contains("User")),
             "Should complain about User type. Got: {:?}",
             diagnostics
         );
 
-        // CORRECT: author is User(...)
+        // User is not registered with the analyzer, so it should produce an error
         let content = r#"Post(
             id: 101,
             author: User(id: 1, name: "John"),
         )"#;
         let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
-        assert_eq!(
-            diagnostics.len(),
-            0,
-            "Should have no errors. Got: {:?}",
+        assert!(
             diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)
+                    && d.message.contains("User")),
+            "Should error on unknown type 'User'. Got: {:?}",
+            diagnostics
+        );
+
+        // When User IS registered, the same content should produce no errors
+        let mut raw_analyzer = RustAnalyzer::new();
+        raw_analyzer.add_type(TypeInfo {
+            name: "User".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "id".to_string(),
+                    type_name: "u32".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+                FieldInfo {
+                    name: "name".to_string(),
+                    type_name: "String".to_string(),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: false,
+                },
+            ]),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        });
+        let analyzer = Arc::new(raw_analyzer);
+        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
+        assert_eq!(
+            errors.len(),
+            0,
+            "Should have no errors when User is registered. Got: {:?}",
+            errors
         );
     }
 
@@ -1749,11 +1768,15 @@ mod tests {
             name: "John",
         )"#;
         let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
         assert_eq!(
-            diagnostics.len(),
+            errors.len(),
             0,
             "Unnamed struct syntax should be valid. Got errors: {:?}",
-            diagnostics
+            errors
         );
     }
 
@@ -2138,8 +2161,9 @@ PostReference(Post(
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message.contains("unknown type 'UnknownType'")),
-            "Should report unknown type error for type written in RON file. Got: {:?}",
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)
+                    && d.message.contains("Unknown type")),
+            "Should report unknown type error for unregistered field type. Got: {:?}",
             diagnostics
         );
     }
