@@ -153,28 +153,35 @@ impl RustAnalyzer {
     }
 
     pub fn get_type_info(&self, type_path: &str) -> Option<&TypeInfo> {
+        // Strip whitespace from the lookup key. Type names extracted from `syn`
+        // via `quote!(#ty).to_string()` are tokenized with spaces around `::`
+        // and `<>`, but cache keys are stored space-free. Without this every
+        // call site would have to remember to pre-normalize.
+        let normalized = type_path.replace(' ', "");
+        let lookup = normalized.as_str();
+
         // Resolve type aliases first
         let resolved_type = self
             .type_aliases
-            .get(type_path)
+            .get(lookup)
             .map(|s| s.as_str())
-            .unwrap_or(type_path);
+            .unwrap_or(lookup);
 
         // Check cache with exact match
         if let Some(info) = self.type_cache.get(resolved_type) {
             return Some(info);
         }
-        // Also try the original type path
-        if let Some(info) = self.type_cache.get(type_path) {
+        // Also try the original (normalized) type path
+        if let Some(info) = self.type_cache.get(lookup) {
             return Some(info);
         }
 
         // If not found by exact match, try finding by simple name
         // e.g., "PostType" should match "crate::models::PostType"
         for (key, value) in self.type_cache.iter() {
-            if key.ends_with(&format!("::{}", type_path))
+            if key.ends_with(&format!("::{}", lookup))
                 || key.ends_with(&format!("::{}", resolved_type))
-                || key == type_path
+                || key == lookup
                 || key == resolved_type
             {
                 return Some(value);
@@ -918,6 +925,31 @@ mod tests {
 
         let inner_type = analyzer.get_type_info("crate::inner::InnerType");
         assert!(inner_type.is_some(), "InnerType should be found");
+    }
+
+    #[test]
+    fn test_get_type_info_strips_whitespace() {
+        let mut analyzer = RustAnalyzer::new();
+
+        analyzer.add_type(TypeInfo {
+            name: "sandpolis_probe::config::ProbeLayerConfig".to_string(),
+            kind: TypeKind::Struct(vec![]),
+            docs: None,
+            source_file: None,
+            line: None,
+            column: None,
+            has_default: false,
+        });
+
+        // syn's `quote!(#ty).to_string()` produces field type names with
+        // spaces around `::`. Callers may forward that string verbatim, so
+        // lookups must tolerate the whitespace.
+        let found = analyzer.get_type_info("sandpolis_probe :: config :: ProbeLayerConfig");
+        assert!(
+            found.is_some(),
+            "lookup should normalize whitespace in the type path"
+        );
+        assert_eq!(found.unwrap().name, "sandpolis_probe::config::ProbeLayerConfig");
     }
 
     #[test]

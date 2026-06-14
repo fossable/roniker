@@ -539,7 +539,7 @@ async fn validate_field_value_node<'a>(
         && !is_std_generic_type(&field_type_normalized)
     {
         // Plain custom struct/enum — validate the node directly
-        if let Some(nested_type_info) = analyzer.get_type_info(field_type).cloned() {
+        if let Some(nested_type_info) = analyzer.get_type_info(&field_type_normalized).cloned() {
             let nested_diags = Box::pin(validate_node_with_type_info(
                 value_node,
                 content,
