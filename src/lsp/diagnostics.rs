@@ -1,17 +1,53 @@
 use super::tree_sitter_parser;
 use super::ts_utils::ParsedEnumVariant;
+use super::type_utils::{
+    extract_inner_type, is_primitive_type, is_std_generic_type, missing_required_fields,
+    short_name,
+};
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use ron::Value;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
+use tree_sitter::Tree;
+
+/// Stable diagnostic codes. Clients and code actions can match on these
+/// instead of parsing diagnostic messages.
+pub mod codes {
+    pub const SYNTAX_ERROR: &str = "syntax-error";
+    pub const UNKNOWN_FIELD: &str = "unknown-field";
+    pub const DUPLICATE_FIELD: &str = "duplicate-field";
+    pub const MISSING_REQUIRED_FIELD: &str = "missing-required-field";
+    pub const UNKNOWN_VARIANT: &str = "unknown-variant";
+    pub const UNKNOWN_TYPE: &str = "unknown-type";
+    pub const TYPE_MISMATCH: &str = "type-mismatch";
+}
+
+fn code(code: &str) -> Option<NumberOrString> {
+    Some(NumberOrString::String(code.to_string()))
+}
 
 /// Validate RON with access to RustAnalyzer for recursive type lookups
 pub async fn validate_ron_with_analyzer(
     content: &str,
+    tree: Option<&Tree>,
     type_info: &TypeInfo,
     analyzer: Arc<RustAnalyzer>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
+
+    // Reuse the document's tree if provided; otherwise (e.g. when recursing
+    // into extracted fragments) parse the content once here.
+    let local_tree;
+    let tree = match tree {
+        Some(t) => t,
+        None => match super::ts_utils::RonParser::new().parse(content) {
+            Some(t) => {
+                local_tree = t;
+                &local_tree
+            }
+            None => return diagnostics,
+        },
+    };
 
     // Parse RON once and check for syntax errors from the result
     // Try to parse the RON content
@@ -27,22 +63,17 @@ pub async fn validate_ron_with_analyzer(
             range: Range::new(Position::new(line, col), Position::new(line, col + 1)),
             severity: Some(DiagnosticSeverity::ERROR),
             message: simplified_msg,
+            code: code(codes::SYNTAX_ERROR),
             ..Default::default()
         });
         return diagnostics;
     }
 
     match &type_info.kind {
-        TypeKind::Struct(fields) => {
+        TypeKind::Struct(_) => {
             diagnostics.extend(
-                validate_struct_fields(
-                    content,
-                    fields,
-                    &parsed_value,
-                    type_info.has_default,
-                    Some(&analyzer),
-                )
-                .await,
+                validate_struct_fields(tree, content, type_info, &parsed_value, Some(&analyzer))
+                    .await,
             );
         }
         TypeKind::Enum(variants) => {
@@ -53,8 +84,9 @@ pub async fn validate_ron_with_analyzer(
     }
 
     // Check for enum variant fields (scans the whole file, so only call once)
-    diagnostics
-        .extend(validate_enum_variant_fields_in_structs(content, type_info, &analyzer).await);
+    diagnostics.extend(
+        validate_enum_variant_fields_in_structs(tree, content, type_info, &analyzer).await,
+    );
 
     // Deduplicate diagnostics by message and position
     let mut seen = std::collections::HashSet::new();
@@ -72,6 +104,7 @@ pub async fn validate_ron_with_analyzer(
 
 /// Validate enum variant fields within struct fields using the same logic as goto_definition
 async fn validate_enum_variant_fields_in_structs(
+    tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
     analyzer: &Arc<RustAnalyzer>,
@@ -80,7 +113,7 @@ async fn validate_enum_variant_fields_in_structs(
     let mut reported_errors = std::collections::HashSet::new();
 
     // Collect all variant locations and group by variant to check for missing fields
-    let variant_locations = tree_sitter_parser::find_all_variant_field_locations(content);
+    let variant_locations = tree_sitter_parser::find_all_variant_field_locations(tree, content);
     let mut variant_info: std::collections::HashMap<
         (String, String),
         (usize, std::collections::HashSet<String>),
@@ -105,99 +138,23 @@ async fn validate_enum_variant_fields_in_structs(
         }
     }
 
-    // Second pass: validate unknown fields - do navigation ONCE per unique variant
+    // Second pass: resolve each unique variant's definition ONCE and cache it
     for ((containing_field_name, variant_name), (first_line, _present_fields)) in &variant_info {
-        // Check if we've already looked up this variant
-        if variant_cache.contains_key(&(containing_field_name.clone(), variant_name.clone())) {
+        let key = (containing_field_name.clone(), variant_name.clone());
+        if variant_cache.contains_key(&key) {
             continue;
         }
 
-        // Do the expensive navigation once per unique variant
-        let position = Position::new(*first_line as u32, 0);
-        let mut contexts = vec![tree_sitter_parser::TypeContext {
-            type_name: type_info
-                .name
-                .split("::")
-                .last()
-                .unwrap_or(&type_info.name)
-                .to_string(),
-        }];
-        let mut position_contexts =
-            tree_sitter_parser::find_type_context_at_position(content, position);
-        if !position_contexts.is_empty() {
-            position_contexts.pop();
-        }
-        contexts.extend(position_contexts);
-
-        let mut current_type_info = Some(type_info.clone());
-        for context in contexts.iter().skip(1) {
-            let info = match current_type_info {
-                Some(ref info) => info.clone(),
-                None => break,
-            };
-
-            if let Some(fields) = info.fields() {
-                let context_name = &context.type_name;
-                if let Some(field) = fields.iter().find(|f| {
-                    let field_type_last = f.type_name.split("::").last().unwrap_or(&f.type_name);
-                    let field_type_base =
-                        field_type_last.split('<').next().unwrap_or(field_type_last);
-                    field_type_base == context_name
-                }) {
-                    current_type_info = analyzer.get_type_info(&field.type_name).cloned();
-                    continue;
-                }
-            }
-
-            let direct_lookup = analyzer.get_type_info(&context.type_name).cloned();
-            if direct_lookup.is_some() {
-                current_type_info = direct_lookup;
-            } else {
-                let mut found_via_variant = false;
-                if let Some(variant) = info.find_variant(&context.type_name)
-                    && variant.fields.len() == 1
-                {
-                    let field_type = &variant.fields[0].type_name;
-                    current_type_info = analyzer.get_type_info(field_type).cloned();
-                    found_via_variant = true;
-                }
-                if !found_via_variant && let Some(fields) = info.fields() {
-                    for field in fields {
-                        if let Some(field_type_info) =
-                            analyzer.get_type_info(&field.type_name).cloned()
-                            && field_type_info.find_variant(&context.type_name).is_some()
-                        {
-                            current_type_info = Some(field_type_info);
-                            found_via_variant = true;
-                            break;
-                        }
-                    }
-                }
-                if !found_via_variant {
-                    current_type_info = None;
-                }
-            }
-        }
-
-        // Look up the variant and cache it
-        let variant = if let Some(current_type) = current_type_info {
-            if let Some(field) = current_type.find_field(containing_field_name) {
-                if let Some(field_type_info) = analyzer.get_type_info(&field.type_name).cloned() {
-                    field_type_info.find_variant(variant_name).cloned()
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        variant_cache.insert(
-            (containing_field_name.clone(), variant_name.clone()),
-            variant,
+        let variant = resolve_variant_at(
+            tree,
+            content,
+            type_info,
+            analyzer,
+            containing_field_name,
+            variant_name,
+            *first_line,
         );
+        variant_cache.insert(key, variant);
     }
 
     // Third pass: check all field locations using cached variant info
@@ -210,7 +167,10 @@ async fn validate_enum_variant_fields_in_structs(
                     location.variant_name.clone(),
                 );
                 if let Some(Some(variant)) = variant_cache.get(&cache_key)
-                    && !variant.fields.iter().any(|f| f.name == *field_at_pos)
+                    && !variant
+                        .effective_fields()
+                        .iter()
+                        .any(|(name, f)| name == field_at_pos || f.name == *field_at_pos)
                 {
                     let line = lines.get(location.line_idx).unwrap_or(&"");
                     if let Some(col) = line
@@ -230,6 +190,7 @@ async fn validate_enum_variant_fields_in_structs(
                                 "Unknown field '{}' in variant '{}'",
                                 field_at_pos, location.variant_name
                             ),
+                            code: code(codes::UNKNOWN_FIELD),
                             ..Default::default()
                         });
                         reported_errors.insert(error_key);
@@ -243,48 +204,74 @@ async fn validate_enum_variant_fields_in_structs(
     for ((containing_field_name, variant_name), (first_line, present_fields)) in variant_info {
         let cache_key = (containing_field_name.clone(), variant_name.clone());
         if let Some(Some(variant)) = variant_cache.get(&cache_key) {
-            // Check for missing required fields
-            for vfield in &variant.fields {
-                if !present_fields.contains(&vfield.name) && !vfield.type_name.starts_with("Option")
-                {
-                    // Note: We don't have has_default info in the cached variant,
-                    // but typically enum variants don't have defaults
-
-                    // Find the variant opening line to report the error
-                    // Search backwards from first_line to find the line with the variant name
-                    let mut variant_line_idx = first_line;
-                    let mut variant_col = 0;
-                    for i in (0..=first_line).rev() {
-                        if let Some(line) = lines.get(i)
-                            && let Some(col) = line.find(&variant_name)
-                        {
-                            variant_line_idx = i;
-                            variant_col = col;
-                            break;
-                        }
+            for (vfield_name, _) in missing_required_fields(&variant.effective_fields(), |name| {
+                present_fields.contains(name)
+            }) {
+                // Find the variant opening line to report the error
+                // Search backwards from first_line to find the line with the variant name
+                let mut variant_line_idx = first_line;
+                let mut variant_col = 0;
+                for i in (0..=first_line).rev() {
+                    if let Some(line) = lines.get(i)
+                        && let Some(col) = line.find(&variant_name)
+                    {
+                        variant_line_idx = i;
+                        variant_col = col;
+                        break;
                     }
-
-                    diagnostics.push(Diagnostic {
-                        range: Range::new(
-                            Position::new(variant_line_idx as u32, variant_col as u32),
-                            Position::new(
-                                variant_line_idx as u32,
-                                (variant_col + variant_name.len()) as u32,
-                            ),
-                        ),
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        message: format!(
-                            "Missing required field '{}' in variant '{}'",
-                            vfield.name, variant_name
-                        ),
-                        ..Default::default()
-                    });
                 }
+
+                diagnostics.push(Diagnostic {
+                    range: Range::new(
+                        Position::new(variant_line_idx as u32, variant_col as u32),
+                        Position::new(
+                            variant_line_idx as u32,
+                            (variant_col + variant_name.len()) as u32,
+                        ),
+                    ),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: format!(
+                        "Missing required field '{}' in variant '{}'",
+                        vfield_name, variant_name
+                    ),
+                    code: code(codes::MISSING_REQUIRED_FIELD),
+                    ..Default::default()
+                });
             }
         }
     }
 
     diagnostics
+}
+
+/// Resolve the enum variant definition for a variant used at a given position:
+/// navigate to the innermost containing type, then look up the containing
+/// field's enum type and its variant.
+fn resolve_variant_at(
+    tree: &Tree,
+    content: &str,
+    type_info: &TypeInfo,
+    analyzer: &RustAnalyzer,
+    containing_field_name: &str,
+    variant_name: &str,
+    first_line: usize,
+) -> Option<EnumVariant> {
+    let position = Position::new(first_line as u32, 0);
+    let mut contexts = vec![tree_sitter_parser::TypeContext {
+        type_name: short_name(&type_info.name).to_string(),
+    }];
+    let mut position_contexts =
+        tree_sitter_parser::find_type_context_at_position(tree, content, position);
+    if !position_contexts.is_empty() {
+        position_contexts.pop();
+    }
+    contexts.extend(position_contexts);
+
+    let current_type =
+        super::navigation::navigate_type_contexts(analyzer, Some(type_info.clone()), &contexts)?;
+    let field = current_type.find_field_serialized(containing_field_name)?;
+    let field_type_info = analyzer.get_type_info(&field.type_name)?;
+    field_type_info.find_variant_serialized(variant_name).cloned()
 }
 
 /// Adjust diagnostic line numbers by an offset
@@ -301,14 +288,17 @@ fn adjust_diagnostic_positions(diagnostics: Vec<Diagnostic>, line_offset: u32) -
 
 /// Helper function for struct validation (async version with analyzer)
 async fn validate_struct_fields(
+    tree: &Tree,
     content: &str,
-    fields: &[FieldInfo],
+    type_info: &TypeInfo,
     parsed_value: &Result<Value, ron::error::SpannedError>,
-    has_default: bool,
     analyzer: Option<&Arc<RustAnalyzer>>,
 ) -> Vec<Diagnostic> {
-    use super::ts_utils::{self, RonParser};
+    use super::ts_utils;
     let mut diagnostics = Vec::new();
+    let Some(fields) = type_info.fields() else {
+        return diagnostics;
+    };
 
     // The RON-parsed map is used for primitive type checking (it understands typed values).
     let ron_map = parsed_value.as_ref().ok().and_then(extract_map_from_value);
@@ -321,9 +311,26 @@ async fn validate_struct_fields(
         return diagnostics;
     }
 
-    let mut parser = RonParser::new();
-    if let Some(tree) = parser.parse(content)
-        && let Some(main_value) = ts_utils::find_main_value(&tree)
+    // The names serde accepts: serialized names, `skip` excluded, `flatten`
+    // expanded when the analyzer can resolve the flattened type.
+    let effective_fields: Vec<(String, FieldInfo)> = match analyzer {
+        Some(analyzer) => type_info.effective_fields(analyzer),
+        None => fields
+            .iter()
+            .filter(|f| !f.skip)
+            .map(|f| {
+                (
+                    f.serialized_name(type_info.rename_all.as_deref()),
+                    f.clone(),
+                )
+            })
+            .collect(),
+    };
+    // A flatten target we can't resolve (e.g. HashMap) accepts arbitrary keys.
+    let allow_unknown_fields =
+        analyzer.is_some_and(|analyzer| type_info.has_unresolved_flatten(analyzer));
+
+    if let Some(main_value) = ts_utils::find_main_value(tree)
         && main_value.kind() == "struct"
     {
         {
@@ -335,14 +342,36 @@ async fn validate_struct_fields(
                     continue;
                 };
 
-                match fields.iter().find(|f| f.name == field_name) {
+                // Duplicate field — report at the second occurrence
+                if present_field_names.contains(&field_name) {
+                    let range =
+                        ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node));
+                    diagnostics.push(Diagnostic {
+                        range,
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message: format!("Duplicate field '{}'", field_name),
+                        code: code(codes::DUPLICATE_FIELD),
+                        ..Default::default()
+                    });
+                    continue;
+                }
+
+                match effective_fields
+                    .iter()
+                    .find(|(name, f)| *name == field_name || f.name == field_name)
+                    .map(|(_, f)| f)
+                {
                     None => {
+                        if allow_unknown_fields {
+                            continue;
+                        }
                         // Unknown field — report at the field name node
-                        let range = ts_utils::node_to_lsp_range(&field_node.child(0).unwrap());
+                        let range = ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node));
                         diagnostics.push(Diagnostic {
                             range,
                             severity: Some(DiagnosticSeverity::ERROR),
                             message: format!("Unknown field '{}'", field_name),
+                            code: code(codes::UNKNOWN_FIELD),
                             ..Default::default()
                         });
                     }
@@ -359,7 +388,7 @@ async fn validate_struct_fields(
                             || value_node.kind() == "identifier";
                         if !type_named_in_file {
                             let field_name_range =
-                                ts_utils::node_to_lsp_range(&field_node.child(0).unwrap());
+                                ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node));
                             diagnostics.push(Diagnostic {
                                 range: field_name_range,
                                 severity: Some(DiagnosticSeverity::INFORMATION),
@@ -395,6 +424,7 @@ async fn validate_struct_fields(
                                 check_type_mismatch_with_enum_validation(
                                     field_value,
                                     &field_info.type_name,
+                                    Some(tree),
                                     content,
                                     field_name,
                                     analyzer,
@@ -404,6 +434,7 @@ async fn validate_struct_fields(
                                 check_type_mismatch_deep(
                                     field_value,
                                     &field_info.type_name,
+                                    Some(tree),
                                     content,
                                     field_name,
                                 )
@@ -426,6 +457,7 @@ async fn validate_struct_fields(
                                     ),
                                     severity: Some(DiagnosticSeverity::ERROR),
                                     message: format!("Type mismatch: {}", error_msg),
+                                    code: code(codes::TYPE_MISMATCH),
                                     ..Default::default()
                                 });
                             }
@@ -435,15 +467,14 @@ async fn validate_struct_fields(
             }
 
             // Missing required fields: compare expected fields against those we saw above.
-            if !has_default {
-                let missing_fields: Vec<_> = fields
-                    .iter()
-                    .filter(|f| !present_field_names.contains(&f.name.as_str()) && !f.is_optional())
-                    .collect();
+            if !type_info.has_default {
+                let missing_fields = missing_required_fields(&effective_fields, |name| {
+                    present_field_names.contains(&name)
+                });
                 if !missing_fields.is_empty() {
                     let missing_names: Vec<String> =
-                        missing_fields.iter().map(|f| f.name.clone()).collect();
-                    let (line, col_start, col_end) = find_struct_name_position(content);
+                        missing_fields.iter().map(|(name, _)| name.clone()).collect();
+                    let (line, col_start, col_end) = find_struct_name_position(tree, content);
                     diagnostics.push(Diagnostic {
                         range: Range::new(
                             Position::new(line, col_start),
@@ -451,6 +482,7 @@ async fn validate_struct_fields(
                         ),
                         severity: Some(DiagnosticSeverity::ERROR),
                         message: format!("Required fields: {}", missing_names.join(", ")),
+                        code: code(codes::MISSING_REQUIRED_FIELD),
                         ..Default::default()
                     });
                 }
@@ -486,14 +518,15 @@ async fn validate_field_value_node<'a>(
             ),
             severity: Some(DiagnosticSeverity::ERROR),
             message: format!("Unknown type '{}'", inner),
+            code: code(codes::UNKNOWN_TYPE),
             ..Default::default()
         }
     };
 
     if let Some(inner_type) = extract_inner_type(&field_type_normalized, "Vec<") {
         // Vec<CustomType> — validate every array element against the inner type
-        if !is_primitive_type(&inner_type) && !is_std_generic_type(&inner_type) {
-            if let Some(inner_type_info) = analyzer.get_type_info(&inner_type).cloned() {
+        if !is_primitive_type(inner_type) && !is_std_generic_type(inner_type) {
+            if let Some(inner_type_info) = analyzer.get_type_info(inner_type).cloned() {
                 if value_node.kind() == "array" {
                     let mut cursor = value_node.walk();
                     for elem_node in value_node.children(&mut cursor) {
@@ -513,7 +546,7 @@ async fn validate_field_value_node<'a>(
                     }
                 }
             } else {
-                diagnostics.push(unknown_type_diag(&inner_type));
+                diagnostics.push(unknown_type_diag(inner_type));
             }
         }
     } else if let Some(inner_type) = ["Option<", "Box<", "Arc<", "Rc<"]
@@ -521,8 +554,8 @@ async fn validate_field_value_node<'a>(
         .find_map(|w| extract_inner_type(&field_type_normalized, w))
     {
         // Single-element wrapper — check the inner type is known
-        if !is_primitive_type(&inner_type) && !is_std_generic_type(&inner_type) {
-            if let Some(inner_type_info) = analyzer.get_type_info(&inner_type).cloned() {
+        if !is_primitive_type(inner_type) && !is_std_generic_type(inner_type) {
+            if let Some(inner_type_info) = analyzer.get_type_info(inner_type).cloned() {
                 let nested_diags = Box::pin(validate_node_with_type_info(
                     value_node,
                     content,
@@ -532,7 +565,7 @@ async fn validate_field_value_node<'a>(
                 .await;
                 diagnostics.extend(nested_diags);
             } else {
-                diagnostics.push(unknown_type_diag(&inner_type));
+                diagnostics.push(unknown_type_diag(inner_type));
             }
         }
     } else if !is_primitive_type(&field_type_normalized)
@@ -562,6 +595,7 @@ async fn validate_field_value_node<'a>(
                 range,
                 severity: Some(DiagnosticSeverity::ERROR),
                 message: format!("Unknown type '{}'", field_type_normalized),
+                code: code(codes::UNKNOWN_TYPE),
                 ..Default::default()
             });
         }
@@ -583,8 +617,12 @@ async fn validate_enum_variant_with_fields(
     let parsed_variant = extract_enum_variant_from_text(content);
 
     if let Some(variant) = parsed_variant {
-        // Check if this variant exists
-        if let Some(variant_def) = variants.iter().find(|v| v.name == variant.name) {
+        // Check if this variant exists (by serialized or Rust name)
+        let rename_all = type_info.rename_all.as_deref();
+        if let Some(variant_def) = variants
+            .iter()
+            .find(|v| v.serialized_name(rename_all) == variant.name || v.name == variant.name)
+        {
             // Variant exists - now validate its fields if it has data
             if let Some(ref data) = variant.data {
                 // Validate that the variant can have data
@@ -599,6 +637,7 @@ async fn validate_enum_variant_with_fields(
                             "Variant '{}' is a unit variant and cannot have data",
                             variant.name
                         ),
+                        code: code(codes::TYPE_MISMATCH),
                         ..Default::default()
                     });
                 } else {
@@ -623,6 +662,7 @@ async fn validate_enum_variant_with_fields(
                     "Unknown variant '{}' for enum '{}'",
                     variant.name, type_info.name
                 ),
+                code: code(codes::UNKNOWN_VARIANT),
                 ..Default::default()
             });
         }
@@ -653,14 +693,33 @@ async fn validate_node_with_type_info<'a>(
             if node.kind() == "struct" {
                 let field_nodes = ts_utils::struct_fields(node);
                 let mut present_fields = std::collections::HashSet::new();
+                let effective_fields = type_info.effective_fields(analyzer);
+                let allow_unknown_fields = type_info.has_unresolved_flatten(analyzer);
 
                 // Check each field in the RON
                 for field_node in field_nodes {
                     if let Some(field_name) = ts_utils::field_name(&field_node, content) {
-                        present_fields.insert(field_name.to_string());
+                        // Duplicate field — report at the second occurrence
+                        if !present_fields.insert(field_name.to_string()) {
+                            let range = ts_utils::node_to_lsp_range(
+                                &field_node.child(0).unwrap_or(field_node),
+                            );
+                            diagnostics.push(Diagnostic {
+                                range,
+                                severity: Some(DiagnosticSeverity::ERROR),
+                                message: format!("Duplicate field '{}'", field_name),
+                                code: code(codes::DUPLICATE_FIELD),
+                                ..Default::default()
+                            });
+                            continue;
+                        }
 
-                        // Check if field exists in type
-                        if let Some(field_info) = fields.iter().find(|f| f.name == field_name) {
+                        // Check if field exists in type (by serialized or Rust name)
+                        if let Some(field_info) = effective_fields
+                            .iter()
+                            .find(|(name, f)| *name == field_name || f.name == field_name)
+                            .map(|(_, f)| f)
+                        {
                             // Delegate to the shared helper for all generic-wrapper and custom types
                             if let Some(value_node) = ts_utils::field_value(&field_node) {
                                 let field_diags = Box::pin(validate_field_value_node(
@@ -672,13 +731,14 @@ async fn validate_node_with_type_info<'a>(
                                 .await;
                                 diagnostics.extend(field_diags);
                             }
-                        } else {
+                        } else if !allow_unknown_fields {
                             // Unknown field
-                            let range = ts_utils::node_to_lsp_range(&field_node.child(0).unwrap());
+                            let range = ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node));
                             diagnostics.push(Diagnostic {
                                 range,
                                 severity: Some(DiagnosticSeverity::ERROR),
                                 message: format!("Unknown field '{}'", field_name),
+                                code: code(codes::UNKNOWN_FIELD),
                                 ..Default::default()
                             });
                         }
@@ -687,27 +747,26 @@ async fn validate_node_with_type_info<'a>(
 
                 // Check for missing required fields
                 if !type_info.has_default {
-                    for field in fields {
-                        if !present_fields.contains(&field.name) && !field.is_optional() {
-                            let target_node = node.child(0).unwrap_or(*node);
-                            let range = ts_utils::node_to_lsp_range(&target_node);
-                            diagnostics.push(Diagnostic {
-                                range,
-                                severity: Some(DiagnosticSeverity::ERROR),
-                                message: format!(
-                                    "Required fields: {}",
-                                    fields
-                                        .iter()
-                                        .filter(|f| !present_fields.contains(&f.name)
-                                            && !f.type_name.starts_with("Option"))
-                                        .map(|f| f.name.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                ),
-                                ..Default::default()
-                            });
-                            break;
-                        }
+                    let missing = missing_required_fields(&effective_fields, |name| {
+                        present_fields.contains(name)
+                    });
+                    if !missing.is_empty() {
+                        let target_node = node.child(0).unwrap_or(*node);
+                        let range = ts_utils::node_to_lsp_range(&target_node);
+                        diagnostics.push(Diagnostic {
+                            range,
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            message: format!(
+                                "Required fields: {}",
+                                missing
+                                    .iter()
+                                    .map(|(name, _)| name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                            code: code(codes::MISSING_REQUIRED_FIELD),
+                            ..Default::default()
+                        });
                     }
                 }
             }
@@ -736,9 +795,9 @@ async fn validate_variant_field_data(
 
         // Check if it's Vec<CustomType>
         if let Some(inner_type) = extract_inner_type(&normalized_type, "Vec<") {
-            if !is_primitive_type(&inner_type)
-                && !is_std_generic_type(&inner_type)
-                && let Some(nested_type_info) = analyzer.get_type_info(&inner_type).cloned()
+            if !is_primitive_type(inner_type)
+                && !is_std_generic_type(inner_type)
+                && let Some(nested_type_info) = analyzer.get_type_info(inner_type).cloned()
             {
                 // Parse with tree-sitter
                 use super::ts_utils::{self, RonParser};
@@ -772,6 +831,7 @@ async fn validate_variant_field_data(
             if let Some(nested_type_info) = analyzer.get_type_info(field_type).cloned() {
                 let nested_diags = Box::pin(validate_ron_with_analyzer(
                     data,
+                    None,
                     &nested_type_info,
                     analyzer.clone(),
                 ))
@@ -824,6 +884,7 @@ async fn validate_variant_field_data(
                             && let Some(error_msg) = check_type_mismatch_with_enum_validation(
                                 field_value,
                                 &field.type_name,
+                                None,
                                 data,
                                 &field.name,
                                 analyzer,
@@ -834,6 +895,7 @@ async fn validate_variant_field_data(
                                 range: Range::new(Position::new(0, 0), Position::new(0, 1)),
                                 severity: Some(DiagnosticSeverity::ERROR),
                                 message: format!("Type mismatch in variant field: {}", error_msg),
+                                code: code(codes::TYPE_MISMATCH),
                                 ..Default::default()
                             });
                         }
@@ -848,6 +910,7 @@ async fn validate_variant_field_data(
                             && let Some(error_msg) = check_type_mismatch_with_enum_validation(
                                 field_value,
                                 &field.type_name,
+                                None,
                                 data,
                                 &field.name,
                                 analyzer,
@@ -861,6 +924,7 @@ async fn validate_variant_field_data(
                                     "Type mismatch in variant field {}: {}",
                                     i, error_msg
                                 ),
+                                code: code(codes::TYPE_MISMATCH),
                                 ..Default::default()
                             });
                         }
@@ -870,6 +934,7 @@ async fn validate_variant_field_data(
                     if let Some(error_msg) = check_type_mismatch_with_enum_validation(
                         &value,
                         &expected_fields[0].type_name,
+                        None,
                         data,
                         &expected_fields[0].name,
                         analyzer,
@@ -880,6 +945,7 @@ async fn validate_variant_field_data(
                             range: Range::new(Position::new(0, 0), Position::new(0, 1)),
                             severity: Some(DiagnosticSeverity::ERROR),
                             message: format!("Type mismatch in variant field: {}", error_msg),
+                            code: code(codes::TYPE_MISMATCH),
                             ..Default::default()
                         });
                     }
@@ -892,6 +958,7 @@ async fn validate_variant_field_data(
                 range: Range::new(Position::new(0, 0), Position::new(0, 1)),
                 severity: Some(DiagnosticSeverity::ERROR),
                 message: "Invalid syntax in enum variant data".to_string(),
+                code: code(codes::SYNTAX_ERROR),
                 ..Default::default()
             });
         }
@@ -906,39 +973,6 @@ fn extract_map_from_value(value: &Value) -> Option<&ron::Map> {
         Value::Map(map) => Some(map),
         _ => None,
     }
-}
-
-/// Check if a type is a primitive type (not a custom enum/struct)
-fn is_primitive_type(type_name: &str) -> bool {
-    let clean = type_name.replace(" ", "");
-
-    // Primitive types
-    let primitives = [
-        "bool", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128",
-        "usize", "f32", "f64", "char", "String", "&str", "str",
-    ];
-
-    if primitives.contains(&clean.as_str()) {
-        return true;
-    }
-
-    false
-}
-
-/// Check if a type is a standard library generic type (Option, Vec, HashMap, etc.)
-fn is_std_generic_type(type_name: &str) -> bool {
-    let clean = type_name.replace(" ", "");
-
-    clean.starts_with("Option<")
-        || clean.starts_with("Vec<")
-        || clean.contains("HashMap<")
-        || clean.contains("BTreeMap<")
-        || clean.contains("HashSet<")
-        || clean.contains("BTreeSet<")
-        || clean.starts_with("Result<")
-        || clean.starts_with("Box<")
-        || clean.starts_with("Rc<")
-        || clean.starts_with("Arc<")
 }
 
 /// Extract the variant name and data from raw RON text using tree-sitter
@@ -969,12 +1003,11 @@ fn extract_enum_variant_from_text(content: &str) -> Option<ParsedEnumVariant> {
 
 /// Find the position of the struct name in the RON content using tree-sitter
 /// Returns (line, col_start, col_end) where col_start == col_end indicates unnamed struct
-fn find_struct_name_position(content: &str) -> (u32, u32, u32) {
-    use super::ts_utils::{self, RonParser};
+fn find_struct_name_position(tree: &Tree, content: &str) -> (u32, u32, u32) {
+    use super::ts_utils;
+    let _ = content;
 
-    let mut parser = RonParser::new();
-    if let Some(tree) = parser.parse(content)
-        && let Some(main_value) = ts_utils::find_main_value(&tree)
+    if let Some(main_value) = ts_utils::find_main_value(tree)
         && main_value.kind() == "struct"
     {
         if let Some(name_node) = main_value.child(0)
@@ -996,6 +1029,7 @@ fn find_struct_name_position(content: &str) -> (u32, u32, u32) {
 async fn check_type_mismatch_with_enum_validation(
     value: &Value,
     expected_type: &str,
+    tree: Option<&Tree>,
     content: &str,
     field_name: &str,
     analyzer: &Arc<RustAnalyzer>,
@@ -1003,7 +1037,7 @@ async fn check_type_mismatch_with_enum_validation(
     // If the expected type is custom (not primitive), we need special handling
     if !is_primitive_type(expected_type)
         && !is_std_generic_type(expected_type)
-        && let Some(field_value_text) = extract_field_value_text(content, field_name)
+        && let Some(field_value_text) = extract_field_value_text(tree, content, field_name)
     {
         let trimmed = field_value_text.trim();
 
@@ -1015,10 +1049,13 @@ async fn check_type_mismatch_with_enum_validation(
         if !type_in_ron.is_empty() && !is_primitive_type(type_in_ron) {
             if let Some(type_info) = analyzer.get_type_info(expected_type).cloned() {
                 if let TypeKind::Enum(variants) = &type_info.kind {
-                    // For enum fields, check if this is a valid variant (case-insensitive to
-                    // handle serde rename_all = "snake_case" etc.)
+                    // For enum fields, accept the serialized name (rename/rename_all),
+                    // the Rust name, or a case-insensitive match as a lenient fallback
+                    let rename_all = type_info.rename_all.as_deref();
                     let variant_match = variants.iter().any(|v| {
-                        v.name == type_in_ron || v.name.to_lowercase() == type_in_ron.to_lowercase()
+                        v.serialized_name(rename_all) == type_in_ron
+                            || v.name == type_in_ron
+                            || v.name.to_lowercase() == type_in_ron.to_lowercase()
                     });
                     if !variant_match {
                         return Some(format!(
@@ -1035,7 +1072,7 @@ async fn check_type_mismatch_with_enum_validation(
                     .unwrap_or(false)
                 {
                     // Expected type is a struct - the name in RON should match or be unnamed
-                    let expected_simple = expected_type.split("::").last().unwrap_or(expected_type);
+                    let expected_simple = short_name(expected_type);
                     if type_in_ron != expected_simple {
                         // Different type name - check if it's a known type or unknown
                         if analyzer.get_type_info(type_in_ron).is_none() {
@@ -1050,7 +1087,7 @@ async fn check_type_mismatch_with_enum_validation(
             } else {
                 // Expected type is not registered in analyzer
                 // If the RON type matches the expected type name, that's fine
-                let expected_simple = expected_type.split("::").last().unwrap_or(expected_type);
+                let expected_simple = short_name(expected_type);
                 if type_in_ron == expected_simple {
                     return None;
                 }
@@ -1064,13 +1101,14 @@ async fn check_type_mismatch_with_enum_validation(
     }
 
     // Do basic type checking for remaining cases
-    check_type_mismatch_deep(value, expected_type, content, field_name)
+    check_type_mismatch_deep(value, expected_type, tree, content, field_name)
 }
 
 /// Deep type checking that also validates custom types by looking at raw text
 fn check_type_mismatch_deep(
     value: &Value,
     expected_type: &str,
+    tree: Option<&Tree>,
     content: &str,
     field_name: &str,
 ) -> Option<String> {
@@ -1085,7 +1123,7 @@ fn check_type_mismatch_deep(
     // because Value loses the type information
 
     // Find the field's value in the raw text
-    let field_value_text = extract_field_value_text(content, field_name)?;
+    let field_value_text = extract_field_value_text(tree, content, field_name)?;
     let trimmed = field_value_text.trim();
 
     // Check if expected type is a custom struct/enum (starts with uppercase)
@@ -1102,7 +1140,7 @@ fn check_type_mismatch_deep(
         if trimmed.contains('(') {
             // Extract the type name before the paren
             let type_in_text = trimmed.split('(').next().unwrap_or("").trim();
-            let expected_simple = clean_type.split("::").last().unwrap_or(&clean_type);
+            let expected_simple = short_name(&clean_type);
 
             // Allow unnamed struct syntax - empty type_in_text means type is inferred
             if !type_in_text.is_empty() && type_in_text != expected_simple {
@@ -1131,12 +1169,18 @@ fn check_type_mismatch_deep(
 }
 
 /// Extract the raw text value for a field, handling nested structures
-fn extract_field_value_text(content: &str, field_name: &str) -> Option<String> {
-    use super::ts_utils::{self, RonParser};
+fn extract_field_value_text(tree: Option<&Tree>, content: &str, field_name: &str) -> Option<String> {
+    use super::ts_utils;
 
-    let mut parser = RonParser::new();
-    let tree = parser.parse(content)?;
-    let main_value = ts_utils::find_main_value(&tree)?;
+    let local_tree;
+    let tree = match tree {
+        Some(t) => t,
+        None => {
+            local_tree = ts_utils::RonParser::new().parse(content)?;
+            &local_tree
+        }
+    };
+    let main_value = ts_utils::find_main_value(tree)?;
 
     if main_value.kind() == "struct" || main_value.kind() == "ERROR" {
         // For ERROR nodes, find the struct sibling
@@ -1178,12 +1222,12 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
         if let Value::Option(Some(inner)) = value {
             // Extract the inner type from Option<InnerType>
             if let Some(inner_type) = extract_inner_type(&clean_type, "Option<") {
-                return check_type_mismatch(inner, &inner_type);
+                return check_type_mismatch(inner, inner_type);
             }
         }
         // Non-Option value for Option type is okay (will be wrapped)
         if let Some(inner_type) = extract_inner_type(&clean_type, "Option<") {
-            return check_type_mismatch(value, &inner_type);
+            return check_type_mismatch(value, inner_type);
         }
     }
 
@@ -1201,7 +1245,7 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
         };
 
         if let Some(inner_type) = extract_inner_type(&clean_type, wrapper) {
-            return check_type_mismatch(value, &inner_type);
+            return check_type_mismatch(value, inner_type);
         }
     }
 
@@ -1250,7 +1294,7 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
                 // Check element types if possible
                 if let Some(elem_type) = extract_inner_type(&clean_type, "Vec<") {
                     for elem in seq {
-                        if let Some(err) = check_type_mismatch(elem, &elem_type) {
+                        if let Some(err) = check_type_mismatch(elem, elem_type) {
                             return Some(format!("in Vec: {}", err));
                         }
                     }
@@ -1296,23 +1340,13 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
                 return Some(format!("expected {}, got None", display_type));
             }
         }
-        Value::Unit => {
-            if clean_type != "()" && clean_type != "unit" {
+        Value::Unit
+            if clean_type != "()" && clean_type != "unit" => {
                 return Some(format!("expected {}, got ()", display_type));
             }
-        }
         _ => {}
     }
 
-    None
-}
-
-/// Extract the inner type from a generic type like Option<T> or Vec<T>
-fn extract_inner_type(type_str: &str, wrapper: &str) -> Option<String> {
-    if type_str.starts_with(wrapper) && type_str.ends_with('>') {
-        let inner = &type_str[wrapper.len()..type_str.len() - 1];
-        return Some(inner.to_string());
-    }
     None
 }
 
@@ -1436,6 +1470,7 @@ mod tests {
                     docs: None,
                     line: None,
                     column: None,
+                    ..Default::default()
                 },
                 EnumVariant {
                     name: "Long".to_string(),
@@ -1443,6 +1478,7 @@ mod tests {
                     docs: None,
                     line: None,
                     column: None,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -1450,11 +1486,12 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         // Valid enum variant
         let content = "Long";
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert_eq!(
             diagnostics.len(),
             0,
@@ -1464,7 +1501,7 @@ mod tests {
 
         // Another valid variant
         let content = "Short";
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert_eq!(
             diagnostics.len(),
             0,
@@ -1474,7 +1511,7 @@ mod tests {
 
         // Invalid enum variant
         let content = "Medium";
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert_eq!(diagnostics.len(), 1, "Medium should be invalid");
         assert!(
             diagnostics[0].message.contains("Unknown variant 'Medium'"),
@@ -1484,7 +1521,7 @@ mod tests {
 
         // Invalid enum variant (typo)
         let content = "Longs";
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert_eq!(diagnostics.len(), 1, "Longs should be invalid");
         assert!(
             diagnostics[0].message.contains("Unknown variant 'Longs'"),
@@ -1506,6 +1543,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "title".to_string(),
@@ -1514,6 +1552,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "post_type".to_string(),
@@ -1522,6 +1561,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -1529,6 +1569,7 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         // PostType is not registered with the analyzer, so it should produce an error
@@ -1537,7 +1578,7 @@ mod tests {
             title: "Test",
             post_type: Long,
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
         assert!(
             diagnostics
                 .iter()
@@ -1561,6 +1602,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "author".to_string(),
@@ -1569,6 +1611,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -1576,6 +1619,7 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         // WRONG: author should be User(...), not just 1
@@ -1583,9 +1627,9 @@ mod tests {
             id: 101,
             author: 1,
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert!(
-            diagnostics.len() > 0,
+            !diagnostics.is_empty(),
             "Should error on primitive when expecting struct"
         );
         assert!(
@@ -1601,7 +1645,7 @@ mod tests {
             id: 101,
             author: User(id: 1, name: "John"),
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
         assert!(
             diagnostics.iter().any(
                 |d| d.severity == Some(DiagnosticSeverity::ERROR) && d.message.contains("User")
@@ -1622,6 +1666,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "name".to_string(),
@@ -1630,6 +1675,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -1637,9 +1683,10 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         });
         let analyzer = Arc::new(raw_analyzer);
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
         let errors: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
@@ -1665,6 +1712,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "name".to_string(),
@@ -1673,6 +1721,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -1680,6 +1729,7 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         // Type mismatch - string for number
@@ -1687,8 +1737,8 @@ mod tests {
             id: "not a number",
             name: "John",
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
-        assert!(diagnostics.len() > 0, "Should error on type mismatch");
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
+        assert!(!diagnostics.is_empty(), "Should error on type mismatch");
         assert!(
             diagnostics
                 .iter()
@@ -1734,6 +1784,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "post_type".to_string(),
@@ -1742,6 +1793,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -1749,6 +1801,7 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         // Invalid: "Longs" is not a valid PostType variant
@@ -1758,7 +1811,7 @@ mod tests {
             id: 1,
             post_type: Longs,
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
         // Without analyzer, this won't be caught - that's expected
         // With analyzer (in real LSP), check_type_mismatch_with_enum_validation will catch it
         println!("Diagnostics for invalid enum variant: {:?}", diagnostics);
@@ -1777,6 +1830,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "name".to_string(),
@@ -1785,6 +1839,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -1792,6 +1847,7 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         // Unnamed struct syntax should be valid
@@ -1799,7 +1855,7 @@ mod tests {
             id: 1,
             name: "John",
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
         let errors: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
@@ -1827,10 +1883,12 @@ mod tests {
                         line: None,
                         column: None,
                         has_default: false,
+                        ..Default::default()
                     }],
                     docs: None,
                     line: None,
                     column: None,
+                    ..Default::default()
                 },
                 EnumVariant {
                     name: "Str".to_string(),
@@ -1841,10 +1899,12 @@ mod tests {
                         line: None,
                         column: None,
                         has_default: false,
+                        ..Default::default()
                     }],
                     docs: None,
                     line: None,
                     column: None,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -1852,11 +1912,12 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         // Valid tuple variant
         let content = "Int(42)";
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer.clone()).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
         assert_eq!(
             diagnostics.len(),
             0,
@@ -1866,7 +1927,7 @@ mod tests {
 
         // Another valid variant
         let content = r#"Str("hello")"#;
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
         assert_eq!(
             diagnostics.len(),
             0,
@@ -1890,6 +1951,7 @@ mod tests {
                         line: None,
                         column: None,
                         has_default: false,
+                        ..Default::default()
                     },
                     FieldInfo {
                         name: "sender".to_string(),
@@ -1898,22 +1960,25 @@ mod tests {
                         line: None,
                         column: None,
                         has_default: false,
+                        ..Default::default()
                     },
                 ],
                 docs: None,
                 line: None,
                 column: None,
+                ..Default::default()
             }]),
             docs: None,
             source_file: None,
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         // Struct-like variant (this requires parentheses in RON)
         let content = r#"Text { content: "hello", sender: "alice" }"#;
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
         // This might not validate correctly without proper struct-variant handling
         // but we're testing that it parses and doesn't crash
         println!("Struct variant diagnostics: {:?}", diagnostics);
@@ -1941,7 +2006,7 @@ mod tests {
     id: 42,
     post_type: Detailed( length: 1 ),
 )"#;
-        let extracted = extract_field_value_text(content, "post_type");
+        let extracted = extract_field_value_text(None, content, "post_type");
         println!("Extracted post_type value: {:?}", extracted);
         assert!(extracted.is_some());
         let value = extracted.unwrap();
@@ -1979,6 +2044,7 @@ PostReference(Post(
                     docs: None,
                     line: None,
                     column: None,
+                    ..Default::default()
                 },
                 EnumVariant {
                     name: "Inactive".to_string(),
@@ -1986,6 +2052,7 @@ PostReference(Post(
                     docs: None,
                     line: None,
                     column: None,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -1993,11 +2060,12 @@ PostReference(Post(
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         // Unit variant should not have data
         let content = "Active(123)";
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
         // Should get error for providing data to unit variant
         assert!(
             diagnostics
@@ -2022,6 +2090,7 @@ PostReference(Post(
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "name".to_string(),
@@ -2030,6 +2099,7 @@ PostReference(Post(
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "email".to_string(),
@@ -2038,6 +2108,7 @@ PostReference(Post(
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "age".to_string(),
@@ -2046,6 +2117,7 @@ PostReference(Post(
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "is_active".to_string(),
@@ -2054,6 +2126,7 @@ PostReference(Post(
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "roles".to_string(),
@@ -2062,6 +2135,7 @@ PostReference(Post(
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -2069,6 +2143,7 @@ PostReference(Post(
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         // Register User type with the analyzer
@@ -2088,21 +2163,24 @@ PostReference(Post(
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 }],
                 docs: None,
                 line: None,
                 column: None,
+                ..Default::default()
             }]),
             docs: None,
             source_file: None,
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         // Test with missing required fields in User structs
         let content = r#"UserTag([User(age: 22), User(email: "hello")])"#;
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
 
         // We expect errors about missing fields
         // First User(age: 22) is missing: id, name, email, is_active, roles
@@ -2166,6 +2244,7 @@ PostReference(Post(
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "author".to_string(),
@@ -2174,6 +2253,7 @@ PostReference(Post(
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -2181,6 +2261,7 @@ PostReference(Post(
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         // The user writes "UnknownType" in the RON file - this type doesn't exist
@@ -2188,7 +2269,7 @@ PostReference(Post(
             id: 1,
             author: UnknownType(name: "John"),
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
 
         assert!(
             diagnostics
@@ -2213,6 +2294,7 @@ PostReference(Post(
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "name".to_string(),
@@ -2221,6 +2303,7 @@ PostReference(Post(
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -2228,6 +2311,7 @@ PostReference(Post(
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         let mut analyzer = RustAnalyzer::new();
@@ -2244,6 +2328,7 @@ PostReference(Post(
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "author".to_string(),
@@ -2252,6 +2337,7 @@ PostReference(Post(
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -2259,6 +2345,7 @@ PostReference(Post(
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         // User type is known - should not error
@@ -2266,13 +2353,322 @@ PostReference(Post(
             id: 1,
             author: User(id: 42, name: "John"),
         )"#;
-        let diagnostics = validate_ron_with_analyzer(content, &type_info, analyzer).await;
+        let diagnostics = validate_ron_with_analyzer(content, None, &type_info, analyzer).await;
 
         assert!(
             !diagnostics
                 .iter()
                 .any(|d| d.message.contains("unknown type")),
             "Should NOT report unknown type error when type is registered. Got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serde_rename_all_fields() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "max_connections".to_string(),
+                    type_name: "u32".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "debug_mode".to_string(),
+                    type_name: "bool".to_string(),
+                    has_default: true,
+                    ..Default::default()
+                },
+            ]),
+            rename_all: Some("camelCase".to_string()),
+            ..Default::default()
+        };
+
+        // The serialized (camelCase) name is what serde expects
+        let content = "(maxConnections: 5)";
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            "camelCase name should be accepted. Got: {:?}",
+            diagnostics
+        );
+
+        // The Rust name is tolerated as a lenient fallback
+        let content = "(max_connections: 5)";
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            "Rust name fallback should be accepted. Got: {:?}",
+            diagnostics
+        );
+
+        // A missing required field is reported under its serialized name
+        let content = "(debugMode: true)";
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("maxConnections")),
+            "Missing field should use serialized name. Got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serde_field_rename() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "config_kind".to_string(),
+                type_name: "String".to_string(),
+                rename: Some("kind".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let content = r#"(kind: "full")"#;
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            "Renamed field should be accepted. Got: {:?}",
+            diagnostics
+        );
+
+        let content = r#"(totally_unknown: "full")"#;
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("Unknown field 'totally_unknown'")),
+            "Unknown field should still error. Got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serde_skip_and_flatten() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Extra".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "verbose".to_string(),
+                type_name: "bool".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let analyzer = Arc::new(analyzer);
+
+        let type_info = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "name".to_string(),
+                    type_name: "String".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "runtime_state".to_string(),
+                    type_name: "String".to_string(),
+                    skip: true,
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "extra".to_string(),
+                    type_name: "Extra".to_string(),
+                    flatten: true,
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        // Flattened fields are accepted at the top level; skipped fields are
+        // not required and not accepted
+        let content = r#"(name: "app", verbose: true)"#;
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+            "Flattened field should be accepted. Got: {:?}",
+            diagnostics
+        );
+
+        // Missing the flattened required field is an error
+        let content = r#"(name: "app")"#;
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        assert!(
+            diagnostics.iter().any(|d| d.message.contains("verbose")),
+            "Missing flattened field should error. Got: {:?}",
+            diagnostics
+        );
+
+        // A skipped field in the file is unknown to serde
+        let content = r#"(name: "app", verbose: true, runtime_state: "x")"#;
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("Unknown field 'runtime_state'")),
+            "Skipped field should be unknown. Got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serde_unresolved_flatten_allows_unknown_fields() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "extra".to_string(),
+                type_name: "HashMap<String, String>".to_string(),
+                flatten: true,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        // Flattening into a map means serde accepts arbitrary keys
+        let content = r#"(anything: "goes", here: "too")"#;
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("Unknown field")),
+            "Unresolved flatten should suppress unknown-field errors. Got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_field_diagnostic() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "name".to_string(),
+                type_name: "String".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let content = "(\n    name: \"a\",\n    name: \"b\",\n)";
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        let duplicate: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("Duplicate field 'name'"))
+            .collect();
+        assert_eq!(duplicate.len(), 1, "Got: {:?}", diagnostics);
+        assert_eq!(
+            duplicate[0].range.start.line, 2,
+            "Duplicate should be reported at the second occurrence"
+        );
+        assert_eq!(
+            duplicate[0].code,
+            Some(NumberOrString::String(codes::DUPLICATE_FIELD.to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_field_diagnostic_nested() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer.add_type(TypeInfo {
+            name: "Inner".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "value".to_string(),
+                type_name: "u32".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let analyzer = Arc::new(analyzer);
+
+        let type_info = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "inner".to_string(),
+                type_name: "Inner".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let content = "(\n    inner: (\n        value: 1,\n        value: 2,\n    ),\n)";
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("Duplicate field 'value'")),
+            "Nested duplicate should be reported. Got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serde_renamed_enum_variant() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "FastMode".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "OldMode".to_string(),
+                    rename: Some("legacy".to_string()),
+                    ..Default::default()
+                },
+            ]),
+            rename_all: Some("snake_case".to_string()),
+            ..Default::default()
+        };
+
+        // rename_all applies to the first variant, explicit rename to the second
+        for content in ["fast_mode", "legacy", "FastMode"] {
+            let diagnostics =
+                validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+                "'{}' should be a valid variant. Got: {:?}",
+                content,
+                diagnostics
+            );
+        }
+
+        let diagnostics =
+            validate_ron_with_analyzer("bogus_mode", None, &type_info, analyzer.clone()).await;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("Unknown variant 'bogus_mode'")),
+            "Unknown variant should still error. Got: {:?}",
             diagnostics
         );
     }

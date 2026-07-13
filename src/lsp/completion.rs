@@ -1,10 +1,12 @@
 use super::tree_sitter_parser;
-use crate::rust_analyzer::{RustAnalyzer, TypeInfo, TypeKind};
+use super::type_utils::{extract_inner_type, innermost_generic, short_name};
+use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent, MarkupKind,
     Position,
 };
+use tree_sitter::Tree;
 
 #[derive(Debug, PartialEq)]
 enum CompletionContext {
@@ -14,16 +16,10 @@ enum CompletionContext {
 }
 
 /// Determine what we're completing based on cursor position using tree-sitter
-fn get_completion_context(content: &str, position: Position) -> CompletionContext {
-    use super::ts_utils::{self, RonParser};
+fn get_completion_context(tree: &Tree, content: &str, position: Position) -> CompletionContext {
+    use super::ts_utils;
 
-    let mut parser = RonParser::new();
-    let tree = match parser.parse(content) {
-        Some(t) => t,
-        None => return CompletionContext::FieldName,
-    };
-
-    let node = match ts_utils::node_at_position(&tree, content, position) {
+    let node = match ts_utils::node_at_position(tree, content, position) {
         Some(n) => n,
         None => return CompletionContext::FieldName,
     };
@@ -62,6 +58,7 @@ fn get_completion_context(content: &str, position: Position) -> CompletionContex
 /// Generate completions for a given type (already navigated to the innermost type)
 /// Type context navigation is now done in main.rs using Backend::navigate_to_innermost_type
 pub fn generate_completions_for_type(
+    tree: &Tree,
     content: &str,
     position: Position,
     type_info: &TypeInfo,
@@ -69,15 +66,15 @@ pub fn generate_completions_for_type(
 ) -> Vec<CompletionItem> {
     let effective_type = type_info;
 
-    let context = get_completion_context(content, position);
+    let context = get_completion_context(tree, content, position);
 
     match context {
         CompletionContext::FieldName => {
-            generate_field_completions(content, position, effective_type)
+            generate_field_completions(tree, content, position, effective_type, &analyzer)
         }
         CompletionContext::FieldValue => {
             // Find the field we're completing the value for
-            if let Some(field_name) = find_current_field(content, position) {
+            if let Some(field_name) = find_current_field(tree, content, position) {
                 let mut completions = generate_value_completions_for_field(
                     field_name,
                     effective_type,
@@ -94,7 +91,7 @@ pub fn generate_completions_for_type(
         }
         CompletionContext::StructType => {
             // Find the field type and provide struct completions
-            if let Some(field_name) = find_current_field(content, position) {
+            if let Some(field_name) = find_current_field(tree, content, position) {
                 generate_type_completions_for_field(field_name, effective_type, analyzer)
             } else {
                 Vec::new()
@@ -112,120 +109,94 @@ fn get_all_workspace_types(analyzer: Arc<RustAnalyzer>) -> Vec<CompletionItem> {
         .collect()
 }
 
+/// Build a completion item for a struct/variant field, labeled with the name
+/// serde expects in the RON file.
+fn field_completion(name: &str, field: &FieldInfo) -> CompletionItem {
+    let signature = format!("```rust\n{}: {}\n```", name, field.type_name);
+    let value = match &field.docs {
+        Some(docs) => format!("{}\n\n{}", signature, docs),
+        None => signature,
+    };
+
+    CompletionItem {
+        label: name.to_string(),
+        kind: Some(CompletionItemKind::FIELD),
+        detail: Some(field.type_name.clone()),
+        documentation: Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        })),
+        insert_text: Some(format!("{}: ", name)),
+        ..Default::default()
+    }
+}
+
 fn generate_field_completions(
+    tree: &Tree,
     content: &str,
     position: Position,
     type_info: &TypeInfo,
+    analyzer: &RustAnalyzer,
 ) -> Vec<CompletionItem> {
     match &type_info.kind {
-        TypeKind::Struct(fields) => {
+        TypeKind::Struct(_) => {
             // Get fields already used in the RON file
-            let used_fields = tree_sitter_parser::extract_fields_from_ron(content);
+            let used_fields = tree_sitter_parser::extract_fields_from_ron(tree, content);
 
-            // Generate completions for unused fields
-            fields
+            // Generate completions for unused fields, using serialized names
+            type_info
+                .effective_fields(analyzer)
                 .iter()
-                .filter(|field| !used_fields.contains(&field.name))
-                .map(|field| {
-                    let documentation = if let Some(docs) = &field.docs {
-                        Some(Documentation::MarkupContent(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: format!(
-                                "```rust\n{}: {}\n```\n\n{}",
-                                field.name, field.type_name, docs
-                            ),
-                        }))
-                    } else {
-                        Some(Documentation::MarkupContent(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: format!("```rust\n{}: {}\n```", field.name, field.type_name),
-                        }))
-                    };
-
-                    CompletionItem {
-                        label: field.name.clone(),
-                        kind: Some(CompletionItemKind::FIELD),
-                        detail: Some(field.type_name.clone()),
-                        documentation,
-                        insert_text: Some(format!("{}: ", field.name)),
-                        ..Default::default()
-                    }
+                .filter(|(name, field)| {
+                    !used_fields.contains(name) && !used_fields.contains(&field.name)
                 })
+                .map(|(name, field)| field_completion(name, field))
                 .collect()
         }
         TypeKind::Enum(variants) => {
             // Check if we're inside a specific variant's fields
             if let Some(variant_name) =
-                tree_sitter_parser::find_current_variant_context(content, position)
-                && let Some(variant) = variants.iter().find(|v| v.name == variant_name)
+                tree_sitter_parser::find_current_variant_context(tree, content, position)
+                && let Some(variant) = type_info.find_variant_serialized(&variant_name)
             {
                 // Complete the variant's fields
-                let used_fields = tree_sitter_parser::extract_fields_from_ron(content);
+                let used_fields = tree_sitter_parser::extract_fields_from_ron(tree, content);
                 return variant
-                    .fields
+                    .effective_fields()
                     .iter()
-                    .filter(|field| !used_fields.contains(&field.name))
-                    .map(|field| {
-                        let documentation = if let Some(docs) = &field.docs {
-                            Some(Documentation::MarkupContent(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: format!(
-                                    "```rust\n{}: {}\n```\n\n{}",
-                                    field.name, field.type_name, docs
-                                ),
-                            }))
-                        } else {
-                            Some(Documentation::MarkupContent(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: format!("```rust\n{}: {}\n```", field.name, field.type_name),
-                            }))
-                        };
-
-                        CompletionItem {
-                            label: field.name.clone(),
-                            kind: Some(CompletionItemKind::FIELD),
-                            detail: Some(field.type_name.clone()),
-                            documentation,
-                            insert_text: Some(format!("{}: ", field.name)),
-                            ..Default::default()
-                        }
+                    .filter(|(name, field)| {
+                        !used_fields.contains(name) && !used_fields.contains(&field.name)
                     })
+                    .map(|(name, field)| field_completion(name, field))
                     .collect();
             }
 
-            // Otherwise, complete variant names
-            // Generate completions for enum variants
+            // Otherwise, complete variant names (serialized, honoring rename/rename_all)
+            let rename_all = type_info.rename_all.as_deref();
             variants
                 .iter()
                 .map(|variant| {
+                    let name = variant.serialized_name(rename_all);
                     let documentation = if let Some(docs) = &variant.docs {
                         Some(Documentation::MarkupContent(MarkupContent {
                             kind: MarkupKind::Markdown,
-                            value: format!("```rust\n{}\n```\n\n{}", variant.name, docs),
+                            value: format!("```rust\n{}\n```\n\n{}", name, docs),
                         }))
                     } else {
                         Some(Documentation::MarkupContent(MarkupContent {
                             kind: MarkupKind::Markdown,
-                            value: format!("```rust\n{}\n```", variant.name),
+                            value: format!("```rust\n{}\n```", name),
                         }))
                     };
 
                     let insert_text = if variant.fields.is_empty() {
-                        variant.name.clone()
-                    } else if variant
-                        .fields
-                        .iter()
-                        .all(|f| f.name.chars().all(|c| c.is_numeric()))
-                    {
-                        // Tuple variant
-                        format!("{}($0)", variant.name)
+                        name.clone()
                     } else {
-                        // Struct variant
-                        format!("{}($0)", variant.name)
+                        format!("{}($0)", name)
                     };
 
                     CompletionItem {
-                        label: variant.name.clone(),
+                        label: name,
                         kind: Some(CompletionItemKind::ENUM_MEMBER),
                         detail: Some(format!("Variant of {}", type_info.name)),
                         documentation,
@@ -239,8 +210,8 @@ fn generate_field_completions(
 }
 
 /// Find the field name for the current cursor position using tree-sitter
-fn find_current_field(content: &str, position: Position) -> Option<String> {
-    tree_sitter_parser::get_field_at_position(content, position)
+fn find_current_field(tree: &Tree, content: &str, position: Position) -> Option<String> {
+    tree_sitter_parser::get_field_at_position(tree, content, position)
 }
 
 /// Generate value completions for a specific field
@@ -249,10 +220,8 @@ fn generate_value_completions_for_field(
     type_info: &TypeInfo,
     analyzer: Arc<RustAnalyzer>,
 ) -> Vec<CompletionItem> {
-    // Find the field in the type info
-    if let TypeKind::Struct(fields) = &type_info.kind
-        && let Some(field) = fields.iter().find(|f| f.name == field_name)
-    {
+    // Find the field in the type info (by serialized or Rust name)
+    if let Some(field) = type_info.find_field_serialized(&field_name) {
         return generate_value_completions_by_type(&field.type_name, analyzer);
     }
 
@@ -265,12 +234,10 @@ fn generate_type_completions_for_field(
     type_info: &TypeInfo,
     analyzer: Arc<RustAnalyzer>,
 ) -> Vec<CompletionItem> {
-    // Find the field in the type info
-    if let TypeKind::Struct(fields) = &type_info.kind
-        && let Some(field) = fields.iter().find(|f| f.name == field_name)
-    {
+    // Find the field in the type info (by serialized or Rust name)
+    if let Some(field) = type_info.find_field_serialized(&field_name) {
         // Get the inner type if it's a generic
-        let inner_type = extract_inner_type(&field.type_name);
+        let inner_type = innermost_generic(&field.type_name);
 
         // Try to get type info for this type
         if let Some(nested_type) = analyzer.get_type_info(&inner_type) {
@@ -283,15 +250,17 @@ fn generate_type_completions_for_field(
 
 /// Create a completion item for a type (struct or enum)
 fn create_type_completion(type_info: &TypeInfo) -> CompletionItem {
-    let type_name = type_info.name.split("::").last().unwrap_or(&type_info.name);
+    let type_name = short_name(&type_info.name);
 
     match &type_info.kind {
         TypeKind::Struct(fields) => {
-            // Generate a snippet for the struct with all fields
+            // Generate a snippet for the struct with all fields (serialized names)
+            let rename_all = type_info.rename_all.as_deref();
             let field_snippets: Vec<String> = fields
                 .iter()
+                .filter(|f| !f.skip)
                 .enumerate()
-                .map(|(i, f)| format!("    {}: ${{{}}}", f.name, i + 1))
+                .map(|(i, f)| format!("    {}: ${{{}}}", f.serialized_name(rename_all), i + 1))
                 .collect();
 
             let snippet = if field_snippets.is_empty() {
@@ -335,19 +304,6 @@ fn create_type_completion(type_info: &TypeInfo) -> CompletionItem {
     }
 }
 
-/// Extract inner type from generics (e.g., Option<T> -> T, Vec<T> -> T)
-fn extract_inner_type(type_string: &str) -> String {
-    let clean = type_string.replace(" ", "");
-
-    if let Some(start) = clean.find('<')
-        && let Some(end) = clean.rfind('>')
-    {
-        return clean[start + 1..end].to_string();
-    }
-
-    type_string.to_string()
-}
-
 /// Generate value completions based on field type
 fn generate_value_completions_by_type(
     field_type: &str,
@@ -362,10 +318,12 @@ fn generate_value_completions_by_type(
     if let Some(type_info) = analyzer.get_type_info(field_type) {
         match &type_info.kind {
             TypeKind::Enum(variants) => {
-                // For enums, provide completions for each variant
+                // For enums, provide completions for each variant (serialized names)
+                let rename_all = type_info.rename_all.as_deref();
                 for variant in variants {
+                    let name = variant.serialized_name(rename_all);
                     let completion = CompletionItem {
-                        label: variant.name.clone(),
+                        label: name.clone(),
                         kind: Some(CompletionItemKind::ENUM_MEMBER),
                         detail: Some(format!("Variant of {}", type_info.name)),
                         documentation: variant.docs.as_ref().map(|docs| {
@@ -374,7 +332,7 @@ fn generate_value_completions_by_type(
                                 value: docs.clone(),
                             })
                         }),
-                        insert_text: Some(variant.name.clone()),
+                        insert_text: Some(name),
                         ..Default::default()
                     };
                     completions.push(completion);
@@ -391,19 +349,13 @@ fn generate_value_completions_by_type(
 
     // Check for generic types and try to provide completions for the inner type
     if clean_type.starts_with("Option<") {
-        let inner = extract_inner_type(&clean_type);
-        if let Some(type_info) = analyzer.get_type_info(&inner) {
+        let inner = extract_inner_type(&clean_type, "Option<").unwrap_or(&clean_type);
+        if let Some(type_info) = analyzer.get_type_info(inner) {
             completions.push(CompletionItem {
-                label: format!(
-                    "Some({})",
-                    type_info.name.split("::").last().unwrap_or(&type_info.name)
-                ),
+                label: format!("Some({})", short_name(&type_info.name)),
                 kind: Some(CompletionItemKind::VALUE),
                 detail: Some("Some variant with nested type".to_string()),
-                insert_text: Some(format!(
-                    "Some({}($0))",
-                    type_info.name.split("::").last().unwrap_or(&type_info.name)
-                )),
+                insert_text: Some(format!("Some({}($0))", short_name(&type_info.name))),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 ..Default::default()
             });
@@ -535,6 +487,7 @@ mod tests {
                     line: Some(10),
                     column: Some(8),
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "field_b".to_string(),
@@ -543,11 +496,13 @@ mod tests {
                     line: Some(11),
                     column: Some(8),
                     has_default: false,
+                    ..Default::default()
                 },
             ],
             docs: Some("A struct variant".to_string()),
             line: Some(9),
             column: Some(4),
+            ..Default::default()
         };
 
         let type_info = TypeInfo {
@@ -558,6 +513,7 @@ mod tests {
             line: Some(8),
             column: Some(0),
             has_default: false,
+            ..Default::default()
         };
 
         // Test content with a struct variant (RON uses parentheses)
@@ -565,7 +521,9 @@ mod tests {
         let position = Position::new(1, 4); // Inside the parens
 
         let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
-        let completions = generate_completions_for_type(content, position, &type_info, analyzer);
+        let tree = crate::lsp::ts_utils::RonParser::new().parse(content).unwrap();
+        let completions =
+            generate_completions_for_type(&tree, content, position, &type_info, analyzer);
 
         // Should complete with variant fields
         assert!(!completions.is_empty());
@@ -590,6 +548,7 @@ mod tests {
             docs: Some("A unit variant".to_string()),
             line: Some(9),
             column: Some(4),
+            ..Default::default()
         };
 
         let variant2 = EnumVariant {
@@ -601,10 +560,12 @@ mod tests {
                 line: None,
                 column: None,
                 has_default: false,
+                ..Default::default()
             }],
             docs: Some("A tuple variant".to_string()),
             line: Some(10),
             column: Some(4),
+            ..Default::default()
         };
 
         let type_info = TypeInfo {
@@ -615,6 +576,7 @@ mod tests {
             line: Some(8),
             column: Some(0),
             has_default: false,
+            ..Default::default()
         };
 
         // Test in FieldName context - should get variant completions
@@ -622,12 +584,94 @@ mod tests {
         let position = Position::new(0, 0);
 
         let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
-        let completions = generate_completions_for_type(content, position, &type_info, analyzer);
+        let tree = crate::lsp::ts_utils::RonParser::new().parse(content).unwrap();
+        let completions =
+            generate_completions_for_type(&tree, content, position, &type_info, analyzer);
 
         // Should complete with variant names
         assert!(!completions.is_empty());
         let variant_labels: Vec<String> = completions.iter().map(|c| c.label.clone()).collect();
         assert!(variant_labels.contains(&"UnitVariant".to_string()));
         assert!(variant_labels.contains(&"TupleVariant".to_string()));
+    }
+
+    #[test]
+    fn test_serde_renamed_field_completion() {
+        let type_info = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "max_connections".to_string(),
+                    type_name: "u32".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "config_kind".to_string(),
+                    type_name: "String".to_string(),
+                    rename: Some("kind".to_string()),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "runtime_state".to_string(),
+                    type_name: "String".to_string(),
+                    skip: true,
+                    ..Default::default()
+                },
+            ]),
+            rename_all: Some("camelCase".to_string()),
+            ..Default::default()
+        };
+
+        let content = "(\n    \n)";
+        let position = Position::new(1, 4);
+        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
+        let tree = crate::lsp::ts_utils::RonParser::new().parse(content).unwrap();
+        let completions =
+            generate_completions_for_type(&tree, content, position, &type_info, analyzer);
+
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"maxConnections"), "got: {:?}", labels);
+        assert!(labels.contains(&"kind"), "got: {:?}", labels);
+        assert!(
+            !labels.contains(&"max_connections") && !labels.contains(&"config_kind"),
+            "Rust names should not be suggested: {:?}",
+            labels
+        );
+        assert!(
+            !labels.contains(&"runtimeState") && !labels.contains(&"runtime_state"),
+            "Skipped fields should not be suggested: {:?}",
+            labels
+        );
+    }
+
+    #[test]
+    fn test_serde_renamed_variant_completion() {
+        let type_info = TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "FastMode".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "OldMode".to_string(),
+                    rename: Some("legacy".to_string()),
+                    ..Default::default()
+                },
+            ]),
+            rename_all: Some("kebab-case".to_string()),
+            ..Default::default()
+        };
+
+        let content = "";
+        let position = Position::new(0, 0);
+        let analyzer = std::sync::Arc::new(crate::rust_analyzer::RustAnalyzer::new());
+        let tree = crate::lsp::ts_utils::RonParser::new().parse(content).unwrap();
+        let completions =
+            generate_completions_for_type(&tree, content, position, &type_info, analyzer);
+
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(labels.contains(&"fast-mode"), "got: {:?}", labels);
+        assert!(labels.contains(&"legacy"), "got: {:?}", labels);
     }
 }

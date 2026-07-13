@@ -1,95 +1,147 @@
 use super::tree_sitter_parser;
 use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use std::sync::Arc;
-use tower_lsp::Client;
 use tower_lsp::lsp_types::*;
+use tree_sitter::Tree;
 
 /// Generate all code actions for a RON document
-pub async fn generate_code_actions(
+pub fn generate_code_actions(
+    tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
-    uri: &str,
+    url: &Url,
     analyzer: Arc<RustAnalyzer>,
-    client: &Client,
+    context_diagnostics: &[Diagnostic],
 ) -> Vec<CodeActionOrCommand> {
     let mut actions = Vec::new();
 
-    // Add actions for making struct names explicit
-    actions.extend(generate_explicit_type_actions(content, type_info, uri));
+    // Quick-fixes for diagnostics in the requested range (remove unknown/duplicate fields)
+    actions.extend(generate_remove_field_actions(
+        tree,
+        content,
+        context_diagnostics,
+        url,
+    ));
 
-    // Add actions for missing fields
-    match &type_info.kind {
-        TypeKind::Struct(fields) => {
-            actions.extend(generate_missing_field_actions(
-                content, fields, type_info, uri,
-            ));
-            // Also check for nested enum variant fields
-            actions.extend(
-                generate_missing_variant_field_actions(
-                    content,
-                    type_info,
-                    uri,
-                    analyzer.clone(),
-                    client,
-                )
-                .await,
-            );
+    // Add actions for making struct names explicit
+    actions.extend(generate_explicit_type_actions(tree, content, type_info, url));
+
+    // Add actions for missing fields (handles both structs and enum variants)
+    actions.extend(generate_missing_field_actions(
+        tree, content, type_info, url, &analyzer,
+    ));
+
+    // Also check for nested enum variant fields
+    actions.extend(generate_missing_variant_field_actions(
+        tree, content, type_info, url, &analyzer,
+    ));
+
+    actions
+}
+
+/// Quick-fixes that delete fields flagged as `unknown-field` or
+/// `duplicate-field` by the published diagnostics.
+pub fn generate_remove_field_actions(
+    tree: &Tree,
+    content: &str,
+    diagnostics: &[Diagnostic],
+    url: &Url,
+) -> Vec<CodeActionOrCommand> {
+    use super::diagnostics::codes;
+    use super::ts_utils;
+
+    let mut actions = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+
+    for diag in diagnostics {
+        let removable = matches!(
+            &diag.code,
+            Some(NumberOrString::String(c))
+                if c == codes::UNKNOWN_FIELD || c == codes::DUPLICATE_FIELD
+        );
+        if !removable {
+            continue;
         }
-        TypeKind::Enum(_) => {
-            // For enums, generate_missing_field_actions handles variant fields internally
-            actions.extend(generate_missing_field_actions(content, &[], type_info, uri));
-            // Also check for nested enum variant fields within the enum's variants
-            actions.extend(
-                generate_missing_variant_field_actions(
-                    content,
-                    type_info,
-                    uri,
-                    analyzer.clone(),
-                    client,
-                )
-                .await,
-            );
+
+        let offset = ts_utils::position_to_byte_offset(content, diag.range.start);
+        let Some(node) = tree.root_node().descendant_for_byte_range(offset, offset) else {
+            continue;
+        };
+        let Some(field_node) = (if node.kind() == "field" {
+            Some(node)
+        } else {
+            ts_utils::find_ancestor_by_kind(node, "field")
+        }) else {
+            continue;
+        };
+        let Some(name) = ts_utils::field_name(&field_node, content) else {
+            continue;
+        };
+
+        // Delete through the trailing comma if present
+        let start = field_node.start_position();
+        let mut end = field_node.end_position();
+        if let Some(next) = field_node.next_sibling()
+            && next.kind() == ","
+        {
+            end = next.end_position();
         }
+
+        // If the field occupies its line(s) alone, remove the whole lines
+        let line_prefix = lines
+            .get(start.row)
+            .map(|l| &l[..start.column.min(l.len())])
+            .unwrap_or("");
+        let line_suffix = lines
+            .get(end.row)
+            .map(|l| &l[end.column.min(l.len())..])
+            .unwrap_or("");
+        let range = if line_prefix.trim().is_empty() && line_suffix.trim().is_empty() {
+            Range::new(
+                Position::new(start.row as u32, 0),
+                Position::new(end.row as u32 + 1, 0),
+            )
+        } else {
+            Range::new(
+                Position::new(start.row as u32, start.column as u32),
+                Position::new(end.row as u32, end.column as u32),
+            )
+        };
+
+        let mut changes = std::collections::HashMap::new();
+        changes.insert(
+            url.clone(),
+            vec![TextEdit {
+                range,
+                new_text: String::new(),
+            }],
+        );
+
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: format!("Remove field '{}'", name),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diag.clone()]),
+            edit: Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
     }
 
     actions
 }
 
 /// Generate code actions for adding missing fields in nested enum variants
-async fn generate_missing_variant_field_actions(
+fn generate_missing_variant_field_actions(
+    tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
-    uri: &str,
-    analyzer: Arc<RustAnalyzer>,
-    client: &Client,
+    url: &Url,
+    analyzer: &RustAnalyzer,
 ) -> Vec<CodeActionOrCommand> {
     let mut actions = Vec::new();
-    let variant_locations = tree_sitter_parser::find_all_variant_field_locations(content);
-
-    client
-        .log_message(
-            MessageType::INFO,
-            format!(
-                "DEBUG code_actions: Found {} variant locations for type {}",
-                variant_locations.len(),
-                type_info.name
-            ),
-        )
-        .await;
-    for loc in &variant_locations {
-        client
-            .log_message(
-                MessageType::INFO,
-                format!(
-                    "  - Line {}: variant={}, containing_field={}, field_at_pos={:?}",
-                    loc.line_idx,
-                    loc.variant_name,
-                    loc.containing_field_name,
-                    loc.field_at_position
-                ),
-            )
-            .await;
-    }
+    let variant_locations = tree_sitter_parser::find_all_variant_field_locations(tree, content);
 
     // Group locations by (containing_field_name, variant_name) to find which fields are used
     let mut variant_fields_map: std::collections::HashMap<
@@ -123,171 +175,79 @@ async fn generate_missing_variant_field_actions(
         }
         seen_variants.insert(key.clone());
 
-        // Need to navigate to the right type that contains this field
-        // The containing_field_name might be a field in a struct, or it might be nested deeper
-
-        // First try: if type_info is a struct, look for the field directly
-        let target_type_info: Option<String> =
-            if let Some(field) = type_info.find_field(&location.containing_field_name) {
-                client
-                    .log_message(
-                        MessageType::INFO,
-                        format!(
-                            "Found field {} in struct {}",
-                            location.containing_field_name, type_info.name
-                        ),
-                    )
-                    .await;
-                Some(field.type_name.clone())
-            } else {
-                // Second try: if type_info is an enum, we need to find which variant contains the field
-                // This means navigating through the structure
-                client
-                    .log_message(
-                        MessageType::INFO,
-                        format!(
-                            "Field {} not found directly, searching in enum variants",
-                            location.containing_field_name
-                        ),
-                    )
-                    .await;
-
-                // Use the same navigation logic as goto_definition would
-                // For now, check if containing_field_name is actually a nested type we can look up
-                None
-            };
-
-        if target_type_info.is_none() {
-            // Try to look up containing_field_name as a type name directly (for nested structs)
-            // This handles cases like Post containing post_type field
-            // We need to figure out what type contains the field with name containing_field_name
-            client
-                .log_message(
-                    MessageType::INFO,
-                    format!(
-                        "Skipping variant location - couldn't resolve containing type for field {}",
-                        location.containing_field_name
-                    ),
-                )
-                .await;
+        // Resolve the containing field directly on the root type; deeper nesting
+        // is not currently handled here
+        let Some(field) = type_info.find_field_serialized(&location.containing_field_name) else {
             continue;
-        }
+        };
 
-        if let Some(field_type_name) = target_type_info {
-            // Get the enum type for this field
-            if let Some(field_type_info) = analyzer.get_type_info(&field_type_name) {
-                client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("Got type info for {}", field_type_name),
-                    )
-                    .await;
-                // Find the variant definition
-                if let Some(variant) = field_type_info.find_variant(&location.variant_name) {
-                    client
-                        .log_message(
-                            MessageType::INFO,
-                            format!(
-                                "Found variant {} with {} fields",
-                                location.variant_name,
-                                variant.fields.len()
-                            ),
-                        )
-                        .await;
-                    // Get fields used in this variant from our map
-                    let used_fields = variant_fields_map.get(&key).cloned().unwrap_or_default();
-                    client
-                        .log_message(MessageType::INFO, format!("Used fields: {:?}", used_fields))
-                        .await;
+        // Get the enum type for this field and find the variant definition
+        let Some(field_type_info) = analyzer.get_type_info(&field.type_name) else {
+            continue;
+        };
+        let Some(variant) = field_type_info.find_variant_serialized(&location.variant_name) else {
+            continue;
+        };
 
-                    let missing_fields: Vec<_> = variant
-                        .fields
-                        .iter()
-                        .filter(|vfield| !used_fields.contains(&vfield.name))
-                        .collect();
+        // Get fields used in this variant from our map
+        let used_fields = variant_fields_map.get(&key).cloned().unwrap_or_default();
 
-                    let required_missing: Vec<_> = missing_fields
-                        .iter()
-                        .filter(|&&vfield| !vfield.is_optional() && !field_type_info.has_default)
-                        .copied()
-                        .collect();
+        let required_missing = if field_type_info.has_default {
+            Vec::new()
+        } else {
+            super::type_utils::missing_required_fields(&variant.effective_fields(), |name| {
+                used_fields.contains(name)
+            })
+        };
 
-                    client
-                        .log_message(
-                            MessageType::INFO,
-                            format!("Missing {} required fields", required_missing.len()),
-                        )
-                        .await;
-                    if !required_missing.is_empty()
-                        && let Some(edit) = generate_field_insertions(&required_missing, content)
-                    {
-                        let mut changes = std::collections::HashMap::new();
-                        changes.insert(tower_lsp::lsp_types::Url::parse(uri).unwrap(), vec![edit]);
+        if !required_missing.is_empty()
+            && let Some(edit) = generate_field_insertions(tree, &required_missing)
+        {
+            let mut changes = std::collections::HashMap::new();
+            changes.insert(url.clone(), vec![edit]);
 
-                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                            title: format!(
-                                "Add {} required field{} to {}::{}",
-                                required_missing.len(),
-                                if required_missing.len() == 1 { "" } else { "s" },
-                                location.containing_field_name,
-                                location.variant_name
-                            ),
-                            kind: Some(CodeActionKind::QUICKFIX),
-                            edit: Some(WorkspaceEdit {
-                                changes: Some(changes),
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        }));
-                    }
-                } else {
-                    client
-                        .log_message(
-                            MessageType::INFO,
-                            format!(
-                                "Variant {} not found in type {}",
-                                location.variant_name, field_type_name
-                            ),
-                        )
-                        .await;
-                }
-            } else {
-                client
-                    .log_message(
-                        MessageType::INFO,
-                        format!("Could not get type info for {}", field_type_name),
-                    )
-                    .await;
-            }
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: format!(
+                    "Add {} required field{} to {}::{}",
+                    required_missing.len(),
+                    if required_missing.len() == 1 { "" } else { "s" },
+                    location.containing_field_name,
+                    location.variant_name
+                ),
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
         }
     }
 
-    client
-        .log_message(
-            MessageType::INFO,
-            format!("Generated {} variant field actions", actions.len()),
-        )
-        .await;
     actions
 }
 
 /// Generate code actions for making implicit struct names explicit
 fn generate_explicit_type_actions(
+    tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
-    uri: &str,
+    url: &Url,
 ) -> Vec<CodeActionOrCommand> {
     let mut actions = Vec::new();
 
     // Check if the root level uses unnamed struct syntax
-    if let Some(action) = create_explicit_root_type_action(content, type_info, uri) {
+    if let Some(action) = create_explicit_root_type_action(tree, content, type_info, url) {
         actions.push(action);
     }
 
     // Check for nested unnamed structs in field values
     if let Some(fields) = type_info.fields() {
+        let rename_all = type_info.rename_all.as_deref();
         for field in fields {
-            if let Some(action) = create_explicit_field_type_action(content, field, uri) {
+            if let Some(action) =
+                create_explicit_field_type_action(tree, content, field, rename_all, url)
+            {
                 actions.push(action);
             }
         }
@@ -298,39 +258,45 @@ fn generate_explicit_type_actions(
 
 /// Generate code actions for adding missing fields
 fn generate_missing_field_actions(
+    tree: &Tree,
     content: &str,
-    fields: &[FieldInfo],
     type_info: &TypeInfo,
-    uri: &str,
+    url: &Url,
+    analyzer: &RustAnalyzer,
 ) -> Vec<CodeActionOrCommand> {
     let mut actions = Vec::new();
 
     // Check if we're in an enum variant context
-    if let TypeKind::Enum(variants) = &type_info.kind {
+    if matches!(type_info.kind, TypeKind::Enum(_)) {
         // Try to detect which variant we're in
         if let Some(variant_name) = detect_current_variant_in_content(content)
-            && let Some(variant) = variants.iter().find(|v| v.name == variant_name)
+            && let Some(variant) = type_info.find_variant_serialized(&variant_name)
         {
             // Generate actions for this variant's fields
-            let ron_fields = tree_sitter_parser::extract_fields_from_ron(content);
-            let all_missing: Vec<_> = variant
-                .fields
+            let ron_fields = tree_sitter_parser::extract_fields_from_ron(tree, content);
+            let effective_fields = variant.effective_fields();
+            let all_missing: Vec<_> = effective_fields
                 .iter()
-                .filter(|field| !ron_fields.contains(&field.name))
+                .filter(|(name, field)| {
+                    !ron_fields.contains(name) && !ron_fields.contains(&field.name)
+                })
+                .cloned()
                 .collect();
 
-            let required_missing: Vec<_> = all_missing
-                .iter()
-                .filter(|&&field| !field.is_optional() && !type_info.has_default)
-                .copied()
-                .collect();
+            let required_missing = if type_info.has_default {
+                Vec::new()
+            } else {
+                super::type_utils::missing_required_fields(&effective_fields, |name| {
+                    ron_fields.iter().any(|f| f == name)
+                })
+            };
 
             // Code action: Add all required fields for variant
             if !required_missing.is_empty()
-                && let Some(edit) = generate_field_insertions(&required_missing, content)
+                && let Some(edit) = generate_field_insertions(tree, &required_missing)
             {
                 let mut changes = std::collections::HashMap::new();
-                changes.insert(tower_lsp::lsp_types::Url::parse(uri).unwrap(), vec![edit]);
+                changes.insert(url.clone(), vec![edit]);
 
                 actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                     title: format!(
@@ -350,10 +316,10 @@ fn generate_missing_field_actions(
 
             // Code action: Add all fields for variant
             if !all_missing.is_empty()
-                && let Some(edit) = generate_field_insertions(&all_missing, content)
+                && let Some(edit) = generate_field_insertions(tree, &all_missing)
             {
                 let mut changes = std::collections::HashMap::new();
-                changes.insert(tower_lsp::lsp_types::Url::parse(uri).unwrap(), vec![edit]);
+                changes.insert(url.clone(), vec![edit]);
 
                 actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                     title: format!(
@@ -376,27 +342,31 @@ fn generate_missing_field_actions(
     }
 
     // Original struct logic
-    let ron_fields = tree_sitter_parser::extract_fields_from_ron(content);
+    let ron_fields = tree_sitter_parser::extract_fields_from_ron(tree, content);
+    let effective_fields = type_info.effective_fields(analyzer);
 
     // Find missing fields
-    let all_missing: Vec<_> = fields
+    let all_missing: Vec<_> = effective_fields
         .iter()
-        .filter(|field| !ron_fields.contains(&field.name))
+        .filter(|(name, field)| !ron_fields.contains(name) && !ron_fields.contains(&field.name))
+        .cloned()
         .collect();
 
     // Find required missing fields (not Option<T> and no Default trait)
-    let required_missing: Vec<_> = all_missing
-        .iter()
-        .filter(|&&field| !field.is_optional() && !type_info.has_default)
-        .copied()
-        .collect();
+    let required_missing = if type_info.has_default {
+        Vec::new()
+    } else {
+        super::type_utils::missing_required_fields(&effective_fields, |name| {
+            ron_fields.iter().any(|f| f == name)
+        })
+    };
 
     // Code action: Add all required fields
     if !required_missing.is_empty()
-        && let Some(edit) = generate_field_insertions(&required_missing, content)
+        && let Some(edit) = generate_field_insertions(tree, &required_missing)
     {
         let mut changes = std::collections::HashMap::new();
-        changes.insert(tower_lsp::lsp_types::Url::parse(uri).unwrap(), vec![edit]);
+        changes.insert(url.clone(), vec![edit]);
 
         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
             title: format!(
@@ -415,10 +385,10 @@ fn generate_missing_field_actions(
 
     // Code action: Add all fields
     if !all_missing.is_empty()
-        && let Some(edit) = generate_field_insertions(&all_missing, content)
+        && let Some(edit) = generate_field_insertions(tree, &all_missing)
     {
         let mut changes = std::collections::HashMap::new();
-        changes.insert(tower_lsp::lsp_types::Url::parse(uri).unwrap(), vec![edit]);
+        changes.insert(url.clone(), vec![edit]);
 
         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
             title: format!(
@@ -441,23 +411,22 @@ fn generate_missing_field_actions(
 /// Create action to make root-level struct name explicit using tree-sitter
 /// Converts: `(field: value)` → `StructName(field: value)`
 fn create_explicit_root_type_action(
+    tree: &Tree,
     content: &str,
     type_info: &TypeInfo,
-    uri: &str,
+    url: &Url,
 ) -> Option<CodeActionOrCommand> {
-    use super::ts_utils::{self, RonParser};
+    use super::ts_utils;
 
-    let mut parser = RonParser::new();
-    let tree = parser.parse(content)?;
-    let main_value = ts_utils::find_main_value(&tree)?;
+    let main_value = ts_utils::find_main_value(tree)?;
 
     if main_value.kind() == "struct" && ts_utils::struct_name(&main_value, content).is_none() {
-        let type_name = type_info.name.split("::").last().unwrap_or(&type_info.name);
+        let type_name = super::type_utils::short_name(&type_info.name);
         let pos = main_value.start_position();
 
         let mut changes = std::collections::HashMap::new();
         changes.insert(
-            tower_lsp::lsp_types::Url::parse(uri).unwrap(),
+            url.clone(),
             vec![TextEdit {
                 range: Range::new(
                     Position::new(pos.row as u32, pos.column as u32),
@@ -484,22 +453,23 @@ fn create_explicit_root_type_action(
 /// Create action to make nested field type explicit using tree-sitter
 /// Converts: `foo: (value)` → `foo: TypeName(value)`
 fn create_explicit_field_type_action(
+    tree: &Tree,
     content: &str,
     field: &FieldInfo,
-    uri: &str,
+    rename_all: Option<&str>,
+    url: &Url,
 ) -> Option<CodeActionOrCommand> {
-    use super::ts_utils::{self, RonParser};
+    use super::ts_utils;
 
-    let mut parser = RonParser::new();
-    let tree = parser.parse(content)?;
-    let main_value = ts_utils::find_main_value(&tree)?;
+    let main_value = ts_utils::find_main_value(tree)?;
 
     if main_value.kind() == "struct" {
         let field_nodes = ts_utils::struct_fields(&main_value);
+        let serialized = field.serialized_name(rename_all);
 
         for field_node in field_nodes {
             if let Some(field_name) = ts_utils::field_name(&field_node, content)
-                && field_name == field.name
+                && (field_name == serialized || field_name == field.name)
                 && let Some(value_node) = ts_utils::field_value(&field_node)
                 && value_node.kind() == "struct"
                 && ts_utils::struct_name(&value_node, content).is_none()
@@ -519,7 +489,7 @@ fn create_explicit_field_type_action(
                 let pos = value_node.start_position();
                 let mut changes = std::collections::HashMap::new();
                 changes.insert(
-                    tower_lsp::lsp_types::Url::parse(uri).unwrap(),
+                    url.clone(),
                     vec![TextEdit {
                         range: Range::new(
                             Position::new(pos.row as u32, pos.column as u32),
@@ -545,16 +515,18 @@ fn create_explicit_field_type_action(
     None
 }
 
-/// Generate text edits to insert missing fields using tree-sitter
-fn generate_field_insertions(missing_fields: &[&FieldInfo], content: &str) -> Option<TextEdit> {
-    use super::ts_utils::{self, RonParser};
+/// Generate text edits to insert missing fields using tree-sitter.
+/// Takes `(serialized_name, field)` pairs so inserted names match what serde expects.
+fn generate_field_insertions(
+    tree: &Tree,
+    missing_fields: &[(String, FieldInfo)],
+) -> Option<TextEdit> {
+    use super::ts_utils;
 
-    let mut parser = RonParser::new();
-    let tree = parser.parse(content)?;
     let root = tree.root_node();
 
     // Try to find struct node even if there's an ERROR (for :: syntax)
-    let main_value = match ts_utils::find_main_value(&tree) {
+    let main_value = match ts_utils::find_main_value(tree) {
         Some(v) => v,
         None => {
             // Fallback: look for any struct node if main value is ERROR
@@ -608,9 +580,9 @@ fn generate_field_insertions(missing_fields: &[&FieldInfo], content: &str) -> Op
     // Use default 4-space indentation
     let indent = "    ";
 
-    for (i, field) in missing_fields.iter().enumerate() {
+    for (i, (name, field)) in missing_fields.iter().enumerate() {
         field_text.push_str(indent);
-        field_text.push_str(&field.name);
+        field_text.push_str(name);
         field_text.push_str(": ");
         field_text.push_str(&generate_default_value(&field.type_name));
         if i < missing_fields.len() - 1 {
@@ -621,8 +593,8 @@ fn generate_field_insertions(missing_fields: &[&FieldInfo], content: &str) -> Op
 
     Some(TextEdit {
         range: Range::new(
-            Position::new(insert_line as u32, insert_col as u32),
-            Position::new(insert_line as u32, insert_col as u32),
+            Position::new(insert_line, insert_col),
+            Position::new(insert_line, insert_col),
         ),
         new_text: field_text,
     })
@@ -688,6 +660,10 @@ fn generate_default_value(type_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(content: &str) -> Tree {
+        super::super::ts_utils::RonParser::new().parse(content).unwrap()
+    }
     use crate::rust_analyzer::TypeKind;
 
     #[test]
@@ -701,10 +677,11 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
-        let uri = "file:///test.ron";
+        let url = Url::parse("file:///test.ron").unwrap();
 
-        let action = create_explicit_root_type_action(content, &type_info, uri);
+        let action = create_explicit_root_type_action(&parse(content), content, &type_info, &url);
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -730,10 +707,11 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
-        let uri = "file:///test.ron";
+        let url = Url::parse("file:///test.ron").unwrap();
 
-        let action = create_explicit_root_type_action(content, &type_info, uri);
+        let action = create_explicit_root_type_action(&parse(content), content, &type_info, &url);
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -758,10 +736,11 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
-        let uri = "file:///test.ron";
+        let url = Url::parse("file:///test.ron").unwrap();
 
-        let action = create_explicit_field_type_action(content, &field, uri);
+        let action = create_explicit_field_type_action(&parse(content), content, &field, None, &url);
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -793,10 +772,11 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
-        let uri = "file:///test.ron";
+        let url = Url::parse("file:///test.ron").unwrap();
 
-        let action = create_explicit_field_type_action(content, &field, uri);
+        let action = create_explicit_field_type_action(&parse(content), content, &field, None, &url);
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -822,10 +802,11 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
-        let uri = "file:///test.ron";
+        let url = Url::parse("file:///test.ron").unwrap();
 
-        let action = create_explicit_field_type_action(content, &field, uri);
+        let action = create_explicit_field_type_action(&parse(content), content, &field, None, &url);
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -848,11 +829,12 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
-        let uri = "file:///test.ron";
+        let url = Url::parse("file:///test.ron").unwrap();
 
         // Should not offer action since type is already explicit
-        let action = create_explicit_root_type_action(content, &type_info, uri);
+        let action = create_explicit_root_type_action(&parse(content), content, &type_info, &url);
         assert!(action.is_none());
     }
 
@@ -866,11 +848,12 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
-        let uri = "file:///test.ron";
+        let url = Url::parse("file:///test.ron").unwrap();
 
         // Should not offer action since field type is already explicit
-        let action = create_explicit_field_type_action(content, &field, uri);
+        let action = create_explicit_field_type_action(&parse(content), content, &field, None, &url);
         assert!(action.is_none());
     }
 
@@ -904,10 +887,11 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
-        let uri = "file:///test.ron";
+        let url = Url::parse("file:///test.ron").unwrap();
 
-        let action = create_explicit_field_type_action(content, &field, uri);
+        let action = create_explicit_field_type_action(&parse(content), content, &field, None, &url);
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -929,8 +913,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_enum_variant_missing_fields() {
+    #[test]
+    fn test_enum_variant_missing_fields() {
         use crate::rust_analyzer::EnumVariant;
 
         let variant = EnumVariant {
@@ -943,6 +927,7 @@ mod tests {
                     line: Some(10),
                     column: Some(8),
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "field_b".to_string(),
@@ -951,11 +936,13 @@ mod tests {
                     line: Some(11),
                     column: Some(8),
                     has_default: false,
+                    ..Default::default()
                 },
             ],
             docs: None,
             line: Some(9),
             column: Some(4),
+            ..Default::default()
         };
 
         let type_info = TypeInfo {
@@ -966,25 +953,19 @@ mod tests {
             line: Some(8),
             column: Some(0),
             has_default: false,
+            ..Default::default()
         };
 
         let content = "MyEnum::StructVariant(\n    field_a: \"test\"\n)";
-        let uri = "file:///test.ron";
+        let url = Url::parse("file:///test.ron").unwrap();
 
         // Create mock analyzer and client for the test
         use crate::rust_analyzer::RustAnalyzer;
         use std::sync::Arc;
 
         let analyzer = Arc::new(RustAnalyzer::new());
-        let (service, _) = tower_lsp::LspService::new(|client| crate::lsp::Backend {
-            client: client.clone(),
-            documents: Default::default(),
-            rust_analyzer: analyzer.clone(),
-            info_diagnostics: true,
-        });
-        let client = service.inner().client.clone();
 
-        let actions = generate_code_actions(content, &type_info, uri, analyzer, &client).await;
+        let actions = generate_code_actions(&parse(content), content, &type_info, &url, analyzer, &[]);
 
         // Should suggest adding missing field_b
         assert!(!actions.is_empty());
@@ -1019,5 +1000,49 @@ mod tests {
         let variant = detect_current_variant_in_content(content);
         println!("Detected variant (should be None): {:?}", variant);
         assert!(variant.is_none());
+    }
+
+    #[test]
+    fn test_remove_unknown_field_action() {
+        let content = "(\n    name: \"a\",\n    bogus: 1,\n)";
+        let url = Url::parse("file:///test.ron").unwrap();
+        let diagnostic = Diagnostic {
+            range: Range::new(Position::new(2, 4), Position::new(2, 9)),
+            severity: Some(DiagnosticSeverity::ERROR),
+            message: "Unknown field 'bogus'".to_string(),
+            code: Some(NumberOrString::String("unknown-field".to_string())),
+            ..Default::default()
+        };
+
+        let actions =
+            generate_remove_field_actions(&parse(content), content, &[diagnostic], &url);
+        assert_eq!(actions.len(), 1);
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected code action");
+        };
+        assert_eq!(action.title, "Remove field 'bogus'");
+
+        let edits = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&url];
+        assert_eq!(edits.len(), 1);
+        // The field is alone on its line: the whole line is removed
+        assert_eq!(edits[0].new_text, "");
+        assert_eq!(edits[0].range.start, Position::new(2, 0));
+        assert_eq!(edits[0].range.end, Position::new(3, 0));
+    }
+
+    #[test]
+    fn test_remove_field_action_ignores_other_codes() {
+        let content = "(name: \"a\")";
+        let url = Url::parse("file:///test.ron").unwrap();
+        let diagnostic = Diagnostic {
+            range: Range::new(Position::new(0, 1), Position::new(0, 5)),
+            message: "Type mismatch: expected u32".to_string(),
+            code: Some(NumberOrString::String("type-mismatch".to_string())),
+            ..Default::default()
+        };
+
+        let actions =
+            generate_remove_field_actions(&parse(content), content, &[diagnostic], &url);
+        assert!(actions.is_empty());
     }
 }

@@ -27,6 +27,7 @@
 //!             line: None,
 //!             column: None,
 //!             has_default: false,
+//!             ..Default::default()
 //!         },
 //!     ]),
 //!     docs: Some("Application configuration".to_string()),
@@ -34,6 +35,7 @@
 //!     line: None,
 //!     column: None,
 //!     has_default: false,
+//!     ..Default::default()
 //! });
 //!
 //! // Query type information

@@ -1,25 +1,6 @@
+use super::ts_utils::{position_to_byte_offset, struct_name};
 use tower_lsp::lsp_types::Position;
-use tree_sitter::{Node, Parser, Tree};
-
-/// Wrapper around tree-sitter parser for RON files
-pub struct RonParser {
-    parser: Parser,
-}
-
-impl RonParser {
-    pub fn new() -> Self {
-        let mut parser = Parser::new();
-        parser
-            .set_language(&ron_lsp_tree_sitter::language())
-            .expect("Error loading RON language");
-        Self { parser }
-    }
-
-    /// Parse RON content and return the tree
-    pub fn parse(&mut self, content: &str) -> Option<Tree> {
-        self.parser.parse(content, None)
-    }
-}
+use tree_sitter::{Node, Tree};
 
 /// Represents the nesting context at a cursor position
 #[derive(Debug, Clone)]
@@ -30,13 +11,11 @@ pub struct TypeContext {
 
 /// Find the nested type context at a cursor position using tree-sitter
 /// Returns a stack of type contexts from outermost to innermost
-pub fn find_type_context_at_position(content: &str, position: Position) -> Vec<TypeContext> {
-    let mut parser = RonParser::new();
-    let tree = match parser.parse(content) {
-        Some(t) => t,
-        None => return Vec::new(),
-    };
-
+pub fn find_type_context_at_position(
+    tree: &Tree,
+    content: &str,
+    position: Position,
+) -> Vec<TypeContext> {
     let root = tree.root_node();
     let byte_offset = position_to_byte_offset(content, position);
 
@@ -48,9 +27,11 @@ pub fn find_type_context_at_position(content: &str, position: Position) -> Vec<T
         // Walk up the tree to collect all struct contexts
         loop {
             if current.kind() == "struct"
-                && let Some(type_name) = extract_struct_name(&current, content)
+                && let Some(type_name) = struct_name(&current, content)
             {
-                contexts.push(TypeContext { type_name });
+                contexts.push(TypeContext {
+                    type_name: type_name.to_string(),
+                });
             }
 
             match current.parent() {
@@ -65,22 +46,8 @@ pub fn find_type_context_at_position(content: &str, position: Position) -> Vec<T
     contexts
 }
 
-/// Extract the struct/variant name from a struct node
-fn extract_struct_name(node: &Node, content: &str) -> Option<String> {
-    // A struct node's first child is typically the identifier (name)
-    if let Some(first_child) = node.child(0)
-        && first_child.kind() == "identifier"
-    {
-        let name = first_child.utf8_text(content.as_bytes()).ok()?;
-        return Some(name.to_string());
-    }
-    None
-}
-
 /// Get the field name at a specific position in RON content using tree-sitter
-pub fn get_field_at_position(content: &str, position: Position) -> Option<String> {
-    let mut parser = RonParser::new();
-    let tree = parser.parse(content)?;
+pub fn get_field_at_position(tree: &Tree, content: &str, position: Position) -> Option<String> {
     let root = tree.root_node();
     let byte_offset = position_to_byte_offset(content, position);
 
@@ -110,9 +77,11 @@ pub fn get_field_at_position(content: &str, position: Position) -> Option<String
 }
 
 /// Find the current variant context (enum variant name) at a position
-pub fn find_current_variant_context(content: &str, position: Position) -> Option<String> {
-    let mut parser = RonParser::new();
-    let tree = parser.parse(content)?;
+pub fn find_current_variant_context(
+    tree: &Tree,
+    content: &str,
+    position: Position,
+) -> Option<String> {
     let root = tree.root_node();
     let byte_offset = position_to_byte_offset(content, position);
 
@@ -124,10 +93,10 @@ pub fn find_current_variant_context(content: &str, position: Position) -> Option
     loop {
         if current.kind() == "struct" {
             // Check if this struct has a name (making it a variant)
-            if let Some(name) = extract_struct_name(&current, content) {
+            if let Some(name) = struct_name(&current, content) {
                 // Make sure it's actually a variant by checking if it's uppercase
                 if name.chars().next()?.is_uppercase() {
-                    return Some(name);
+                    return Some(name.to_string());
                 }
             }
         }
@@ -143,9 +112,11 @@ pub fn find_current_variant_context(content: &str, position: Position) -> Option
 
 /// Get the containing field context by finding the parent field
 /// For example: "post_type: Detailed(\n    length: 1" - when on "length" line, returns "post_type"
-pub fn get_containing_field_context(content: &str, position: Position) -> Option<String> {
-    let mut parser = RonParser::new();
-    let tree = parser.parse(content)?;
+pub fn get_containing_field_context(
+    tree: &Tree,
+    content: &str,
+    position: Position,
+) -> Option<String> {
     let root = tree.root_node();
     let byte_offset = position_to_byte_offset(content, position);
 
@@ -182,30 +153,6 @@ pub fn get_containing_field_context(content: &str, position: Position) -> Option
     None
 }
 
-/// Helper to convert LSP Position to byte offset in content
-fn position_to_byte_offset(content: &str, position: Position) -> usize {
-    let mut offset = 0;
-    let mut current_line = 0;
-    let mut current_col = 0;
-
-    for ch in content.chars() {
-        if current_line == position.line as usize && current_col == position.character as usize {
-            return offset;
-        }
-
-        if ch == '\n' {
-            current_line += 1;
-            current_col = 0;
-        } else {
-            current_col += 1;
-        }
-
-        offset += ch.len_utf8();
-    }
-
-    offset
-}
-
 /// Information about a variant field location in RON content
 #[derive(Debug, Clone)]
 pub struct VariantFieldLocation {
@@ -216,13 +163,7 @@ pub struct VariantFieldLocation {
 }
 
 /// Scan through content and find all variant field locations
-pub fn find_all_variant_field_locations(content: &str) -> Vec<VariantFieldLocation> {
-    let mut parser = RonParser::new();
-    let tree = match parser.parse(content) {
-        Some(t) => t,
-        None => return Vec::new(),
-    };
-
+pub fn find_all_variant_field_locations(tree: &Tree, content: &str) -> Vec<VariantFieldLocation> {
     let mut locations = Vec::new();
     let root = tree.root_node();
 
@@ -236,7 +177,7 @@ pub fn find_all_variant_field_locations(content: &str) -> Vec<VariantFieldLocati
 fn visit_fields(node: &Node, content: &str, locations: &mut Vec<VariantFieldLocation>) {
     // Check if this is a struct (potential variant)
     if node.kind() == "struct"
-        && let Some(variant_name) = extract_struct_name(node, content)
+        && let Some(variant_name) = struct_name(node, content)
     {
         // This is a named struct, check if it's a variant (uppercase start)
         if variant_name
@@ -251,7 +192,7 @@ fn visit_fields(node: &Node, content: &str, locations: &mut Vec<VariantFieldLoca
             collect_fields_in_node(
                 node,
                 content,
-                &variant_name,
+                variant_name,
                 &containing_field_name,
                 locations,
             );
@@ -330,13 +271,7 @@ fn collect_fields_in_node(
 }
 
 /// Parse RON structure to get all field names present at the top level
-pub fn extract_fields_from_ron(content: &str) -> Vec<String> {
-    let mut parser = RonParser::new();
-    let tree = match parser.parse(content) {
-        Some(t) => t,
-        None => return Vec::new(),
-    };
-
+pub fn extract_fields_from_ron(tree: &Tree, content: &str) -> Vec<String> {
     let mut fields = std::collections::HashSet::new();
     let root = tree.root_node();
 
@@ -374,6 +309,11 @@ fn collect_direct_field_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::ts_utils::RonParser;
+
+    fn parse(content: &str) -> Tree {
+        RonParser::new().parse(content).unwrap()
+    }
 
     #[test]
     fn test_parse_simple_struct() {
@@ -395,7 +335,7 @@ mod tests {
     ),
 ))"#;
         // Position inside User
-        let contexts = find_type_context_at_position(content, Position::new(3, 20));
+        let contexts = find_type_context_at_position(&parse(content), content, Position::new(3, 20));
         assert_eq!(contexts.len(), 3);
         assert_eq!(contexts[0].type_name, "PostReference");
         assert_eq!(contexts[1].type_name, "Post");
@@ -409,7 +349,7 @@ mod tests {
     age: 30,
 )"#;
         // Position on "name" field
-        let field = get_field_at_position(content, Position::new(1, 8));
+        let field = get_field_at_position(&parse(content), content, Position::new(1, 8));
         assert_eq!(field, Some("name".to_string()));
     }
 
@@ -418,7 +358,7 @@ mod tests {
         let content = r#"Detailed(
     length: 1,
 )"#;
-        let variant = find_current_variant_context(content, Position::new(1, 12));
+        let variant = find_current_variant_context(&parse(content), content, Position::new(1, 12));
         assert_eq!(variant, Some("Detailed".to_string()));
     }
 
@@ -429,7 +369,7 @@ mod tests {
     age: 30,
     items: [],
 )"#;
-        let fields = extract_fields_from_ron(content);
+        let fields = extract_fields_from_ron(&parse(content), content);
         assert!(fields.contains(&"name".to_string()));
         assert!(fields.contains(&"age".to_string()));
         assert!(fields.contains(&"items".to_string()));
@@ -445,10 +385,11 @@ mod tests {
 )"#;
         let position = Position::new(3, 16);
 
-        let variant = find_current_variant_context(content, position);
+        let tree = parse(content);
+        let variant = find_current_variant_context(&tree, content, position);
         assert_eq!(variant, Some("Detailed".to_string()));
 
-        let containing_field = get_containing_field_context(content, position);
+        let containing_field = get_containing_field_context(&tree, content, position);
         assert_eq!(containing_field, Some("post_type".to_string()));
     }
 }

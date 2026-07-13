@@ -22,6 +22,7 @@ fn main() {
                 line: None,
                 column: None,
                 has_default: true,
+                ..Default::default()
             },
             FieldInfo {
                 name: "port".to_string(),
@@ -30,6 +31,7 @@ fn main() {
                 line: None,
                 column: None,
                 has_default: false,
+                ..Default::default()
             },
             FieldInfo {
                 name: "database".to_string(),
@@ -38,6 +40,7 @@ fn main() {
                 line: None,
                 column: None,
                 has_default: false,
+                ..Default::default()
             },
             FieldInfo {
                 name: "log_level".to_string(),
@@ -46,6 +49,7 @@ fn main() {
                 line: None,
                 column: None,
                 has_default: true,
+                ..Default::default()
             },
         ]),
         docs: Some("Main application configuration".to_string()),
@@ -53,6 +57,7 @@ fn main() {
         line: None,
         column: None,
         has_default: false,
+        ..Default::default()
     });
 
     // Register the nested DatabaseConfig struct
@@ -66,6 +71,7 @@ fn main() {
                 line: None,
                 column: None,
                 has_default: false,
+                ..Default::default()
             },
             FieldInfo {
                 name: "port".to_string(),
@@ -74,6 +80,7 @@ fn main() {
                 line: None,
                 column: None,
                 has_default: true,
+                ..Default::default()
             },
             FieldInfo {
                 name: "username".to_string(),
@@ -82,6 +89,7 @@ fn main() {
                 line: None,
                 column: None,
                 has_default: false,
+                ..Default::default()
             },
             FieldInfo {
                 name: "max_connections".to_string(),
@@ -90,6 +98,7 @@ fn main() {
                 line: None,
                 column: None,
                 has_default: false,
+                ..Default::default()
             },
         ]),
         docs: Some("Database connection configuration".to_string()),
@@ -97,6 +106,7 @@ fn main() {
         line: None,
         column: None,
         has_default: false,
+        ..Default::default()
     });
 
     // Register the LogLevel enum
@@ -109,6 +119,7 @@ fn main() {
                 docs: Some("Only log errors".to_string()),
                 line: None,
                 column: None,
+                ..Default::default()
             },
             EnumVariant {
                 name: "Warn".to_string(),
@@ -116,6 +127,7 @@ fn main() {
                 docs: Some("Log warnings and errors".to_string()),
                 line: None,
                 column: None,
+                ..Default::default()
             },
             EnumVariant {
                 name: "Info".to_string(),
@@ -123,6 +135,7 @@ fn main() {
                 docs: Some("Log info, warnings, and errors".to_string()),
                 line: None,
                 column: None,
+                ..Default::default()
             },
             EnumVariant {
                 name: "Debug".to_string(),
@@ -130,6 +143,7 @@ fn main() {
                 docs: Some("Log everything including debug messages".to_string()),
                 line: None,
                 column: None,
+                ..Default::default()
             },
         ]),
         docs: Some("Logging verbosity level".to_string()),
@@ -137,6 +151,7 @@ fn main() {
         line: None,
         column: None,
         has_default: false,
+        ..Default::default()
     });
 
     // Start the LSP server (reads from stdin, writes to stdout)

@@ -21,6 +21,11 @@ impl RonParser {
     pub fn parse(&mut self, content: &str) -> Option<Tree> {
         self.parser.parse(content, None)
     }
+
+    /// Re-parse content reusing a previous (edited) tree for incremental parsing
+    pub fn parse_with(&mut self, content: &str, old_tree: Option<&Tree>) -> Option<Tree> {
+        self.parser.parse(content, old_tree)
+    }
 }
 
 impl Default for RonParser {
@@ -93,6 +98,23 @@ pub fn find_ancestor_by_kind<'a>(mut node: Node<'a>, kind: &str) -> Option<Node<
     None
 }
 
+/// Collect all descendant nodes of a given kind, depth-first
+pub fn descendants_by_kind<'a>(tree: &'a Tree, kind: &str) -> Vec<Node<'a>> {
+    let mut results = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == kind {
+            results.push(node);
+        }
+        for i in (0..node.child_count()).rev() {
+            if let Some(child) = node.child(i) {
+                stack.push(child);
+            }
+        }
+    }
+    results
+}
+
 /// Get all children of a node with a specific kind
 pub fn children_by_kind<'a>(node: &Node<'a>, kind: &str) -> Vec<Node<'a>> {
     let mut results = Vec::new();
@@ -109,10 +131,10 @@ pub fn children_by_kind<'a>(node: &Node<'a>, kind: &str) -> Vec<Node<'a>> {
 #[cfg(test)]
 pub fn child_by_kind<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
-    let result = node
+    
+    node
         .children(&mut cursor)
-        .find(|child| child.kind() == kind);
-    result
+        .find(|child| child.kind() == kind)
 }
 
 /// Get all named children of a node
@@ -412,15 +434,14 @@ mod tests {
 
         if let Some(main) = find_main_value(&tree) {
             let fields = struct_fields(&main);
-            if let Some(author_field) = fields.first() {
-                if let Some(value) = field_value(author_field) {
+            if let Some(author_field) = fields.first()
+                && let Some(value) = field_value(author_field) {
                     let value_text = node_text(&value, content).unwrap();
                     println!("Author field value: {}", value_text);
                     assert!(value_text.contains("User("));
                     assert!(value_text.contains("id: 1"));
                     assert!(value_text.contains("name: \"Alice\""));
                 }
-            }
         }
     }
 

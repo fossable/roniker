@@ -11,7 +11,7 @@ use std::{
 #[cfg(feature = "analyze")]
 use syn::{Fields, Item, ItemEnum, ItemStruct, ItemType};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FieldInfo {
     pub name: String,
     pub type_name: String,
@@ -19,21 +19,139 @@ pub struct FieldInfo {
     pub line: Option<usize>,
     pub column: Option<usize>,
     pub has_default: bool,
+    /// `#[serde(rename = "...")]` on the field
+    #[serde(default)]
+    pub rename: Option<String>,
+    /// `#[serde(skip)]` or `#[serde(skip_deserializing)]` on the field
+    #[serde(default)]
+    pub skip: bool,
+    /// `#[serde(flatten)]` on the field
+    #[serde(default)]
+    pub flatten: bool,
 }
 
 impl FieldInfo {
     pub fn is_optional(&self) -> bool {
-        self.type_name.starts_with("Option") || self.has_default
+        if self.has_default {
+            return true;
+        }
+        // Normalize first: type names from `quote!` are tokenized with spaces
+        // (e.g. "Option < String >")
+        self.type_name.replace(' ', "").starts_with("Option<")
+    }
+
+    /// The name serde expects for this field, honoring `#[serde(rename)]`
+    /// and the container's `#[serde(rename_all)]` convention.
+    pub fn serialized_name(&self, container_rename_all: Option<&str>) -> String {
+        if let Some(rename) = &self.rename {
+            return rename.clone();
+        }
+        if let Some(convention) = container_rename_all {
+            return rename_all_field(&self.name, convention);
+        }
+        self.name.clone()
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Apply a serde `rename_all` convention to a field name.
+/// Mirrors serde's conversions, which assume snake_case Rust field names.
+pub fn rename_all_field(name: &str, convention: &str) -> String {
+    match convention {
+        "lowercase" | "snake_case" => name.to_string(),
+        "UPPERCASE" | "SCREAMING_SNAKE_CASE" => name.to_ascii_uppercase(),
+        "PascalCase" => name
+            .split('_')
+            .map(capitalize)
+            .collect(),
+        "camelCase" => {
+            let pascal = rename_all_field(name, "PascalCase");
+            uncapitalize(&pascal)
+        }
+        "kebab-case" => name.replace('_', "-"),
+        "SCREAMING-KEBAB-CASE" => name.to_ascii_uppercase().replace('_', "-"),
+        _ => name.to_string(),
+    }
+}
+
+/// Apply a serde `rename_all` convention to an enum variant name.
+/// Mirrors serde's conversions, which assume PascalCase Rust variant names.
+pub fn rename_all_variant(name: &str, convention: &str) -> String {
+    match convention {
+        "lowercase" => name.to_ascii_lowercase(),
+        "UPPERCASE" => name.to_ascii_uppercase(),
+        "PascalCase" => name.to_string(),
+        "camelCase" => uncapitalize(name),
+        "snake_case" => pascal_to_snake(name),
+        "SCREAMING_SNAKE_CASE" => pascal_to_snake(name).to_ascii_uppercase(),
+        "kebab-case" => pascal_to_snake(name).replace('_', "-"),
+        "SCREAMING-KEBAB-CASE" => pascal_to_snake(name)
+            .to_ascii_uppercase()
+            .replace('_', "-"),
+        _ => name.to_string(),
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+fn uncapitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+fn pascal_to_snake(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for (i, ch) in name.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.extend(ch.to_lowercase());
+    }
+    out
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EnumVariant {
     pub name: String,
     pub fields: Vec<FieldInfo>,
     pub docs: Option<String>,
     pub line: Option<usize>,
     pub column: Option<usize>,
+    /// `#[serde(rename = "...")]` on the variant
+    #[serde(default)]
+    pub rename: Option<String>,
+}
+
+impl EnumVariant {
+    /// The fields serde accepts for this variant as `(serialized_name, field)`
+    /// pairs, with `skip` fields excluded.
+    pub fn effective_fields(&self) -> Vec<(String, FieldInfo)> {
+        self.fields
+            .iter()
+            .filter(|f| !f.skip)
+            .map(|f| (f.serialized_name(None), f.clone()))
+            .collect()
+    }
+
+    /// The name serde expects for this variant, honoring `#[serde(rename)]`
+    /// and the enum's `#[serde(rename_all)]` convention.
+    pub fn serialized_name(&self, container_rename_all: Option<&str>) -> String {
+        if let Some(rename) = &self.rename {
+            return rename.clone();
+        }
+        if let Some(convention) = container_rename_all {
+            return rename_all_variant(&self.name, convention);
+        }
+        self.name.clone()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,7 +160,13 @@ pub enum TypeKind {
     Enum(Vec<EnumVariant>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Default for TypeKind {
+    fn default() -> Self {
+        TypeKind::Struct(Vec::new())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TypeInfo {
     pub name: String,
     pub kind: TypeKind,
@@ -51,6 +175,9 @@ pub struct TypeInfo {
     pub line: Option<usize>,
     pub column: Option<usize>,
     pub has_default: bool,
+    /// `#[serde(rename_all = "...")]` on the container (e.g. "camelCase")
+    #[serde(default)]
+    pub rename_all: Option<String>,
 }
 
 impl TypeInfo {
@@ -79,6 +206,83 @@ impl TypeInfo {
             TypeKind::Enum(variants) => variants.iter().find(|v| v.name == variant_name),
             TypeKind::Struct(_) => None,
         }
+    }
+
+    /// Find a field by the name serde expects in the serialized form
+    /// (honoring rename/rename_all), falling back to the Rust field name.
+    pub fn find_field_serialized(&self, field_name: &str) -> Option<&FieldInfo> {
+        let rename_all = self.rename_all.as_deref();
+        match &self.kind {
+            TypeKind::Struct(fields) => fields
+                .iter()
+                .find(|f| f.serialized_name(rename_all) == field_name)
+                .or_else(|| fields.iter().find(|f| f.name == field_name)),
+            TypeKind::Enum(variants) => variants
+                .iter()
+                .flat_map(|v| &v.fields)
+                .find(|f| f.serialized_name(None) == field_name)
+                .or_else(|| self.find_field(field_name)),
+        }
+    }
+
+    /// Find a variant by the name serde expects in the serialized form
+    /// (honoring rename/rename_all), falling back to the Rust variant name.
+    pub fn find_variant_serialized(&self, variant_name: &str) -> Option<&EnumVariant> {
+        let TypeKind::Enum(variants) = &self.kind else {
+            return None;
+        };
+        let rename_all = self.rename_all.as_deref();
+        variants
+            .iter()
+            .find(|v| v.serialized_name(rename_all) == variant_name)
+            .or_else(|| variants.iter().find(|v| v.name == variant_name))
+    }
+
+    /// The fields serde accepts for this struct: `skip` fields are excluded,
+    /// `flatten` fields are expanded into the flattened type's fields
+    /// (recursively, depth-limited), and names are serialized names.
+    pub fn effective_fields(&self, analyzer: &RustAnalyzer) -> Vec<(String, FieldInfo)> {
+        self.effective_fields_depth(analyzer, 8)
+    }
+
+    fn effective_fields_depth(
+        &self,
+        analyzer: &RustAnalyzer,
+        depth: usize,
+    ) -> Vec<(String, FieldInfo)> {
+        let mut out = Vec::new();
+        let Some(fields) = self.fields() else {
+            return out;
+        };
+        for field in fields {
+            if field.skip {
+                continue;
+            }
+            if field.flatten {
+                if depth > 0
+                    && let Some(inner) = analyzer.get_type_info(&field.type_name)
+                {
+                    out.extend(inner.effective_fields_depth(analyzer, depth - 1));
+                }
+                continue;
+            }
+            out.push((
+                field.serialized_name(self.rename_all.as_deref()),
+                field.clone(),
+            ));
+        }
+        out
+    }
+
+    /// Whether this struct has a `flatten` field whose target type cannot be
+    /// resolved (e.g. a HashMap). Serde then accepts arbitrary extra keys, so
+    /// unknown-field checks should be suppressed.
+    pub fn has_unresolved_flatten(&self, analyzer: &RustAnalyzer) -> bool {
+        self.fields().is_some_and(|fields| {
+            fields
+                .iter()
+                .any(|f| f.flatten && analyzer.get_type_info(&f.type_name).is_none())
+        })
     }
 }
 
@@ -178,12 +382,10 @@ impl RustAnalyzer {
 
         // If not found by exact match, try finding by simple name
         // e.g., "PostType" should match "crate::models::PostType"
+        let lookup_suffix = format!("::{}", lookup);
+        let resolved_suffix = format!("::{}", resolved_type);
         for (key, value) in self.type_cache.iter() {
-            if key.ends_with(&format!("::{}", lookup))
-                || key.ends_with(&format!("::{}", resolved_type))
-                || key == lookup
-                || key == resolved_type
-            {
+            if key.ends_with(&lookup_suffix) || key.ends_with(&resolved_suffix) {
                 return Some(value);
             }
         }
@@ -450,71 +652,16 @@ impl RustAnalyzer {
         file_path: Option<&Path>,
     ) -> Option<TypeInfo> {
         let struct_name = struct_item.ident.to_string();
-        let full_path = if module_prefix.is_empty() {
-            struct_name.clone()
-        } else {
-            format!("{}::{}", module_prefix, struct_name)
-        };
+        let full_path = qualified_name(module_prefix, &struct_name);
 
         let docs = extract_docs(&struct_item.attrs);
-
-        let fields = match &struct_item.fields {
-            Fields::Named(fields) => fields
-                .named
-                .iter()
-                .map(|field| {
-                    let field_name = field.ident.as_ref().unwrap().to_string();
-                    let type_name = type_to_string(&field.ty);
-                    let field_docs = extract_docs(&field.attrs);
-                    let (line, column) = field
-                        .ident
-                        .as_ref()
-                        .map(|i| {
-                            let start = i.span().start();
-                            (start.line, start.column)
-                        })
-                        .unzip();
-
-                    let field_attributes = serde_attributes::extract_serde_field_attributes(field);
-                    let has_default = field_attributes.has_default;
-
-                    FieldInfo {
-                        name: field_name,
-                        type_name,
-                        docs: field_docs,
-                        line,
-                        column,
-                        has_default,
-                    }
-                })
-                .collect(),
-            Fields::Unnamed(fields) => fields
-                .unnamed
-                .iter()
-                .enumerate()
-                .map(|(i, field)| {
-                    let type_name = type_to_string(&field.ty);
-
-                    let field_attributes = serde_attributes::extract_serde_field_attributes(field);
-                    let has_default = field_attributes.has_default;
-
-                    FieldInfo {
-                        name: i.to_string(),
-                        type_name,
-                        docs: None,
-                        line: None,
-                        column: None,
-                        has_default,
-                    }
-                })
-                .collect(),
-            Fields::Unit => vec![],
-        };
+        let fields = extract_fields(&struct_item.fields);
 
         let start = struct_item.ident.span().start();
         let line = Some(start.line);
         let column = Some(start.column);
         let has_default = has_default_derive(&struct_item.attrs);
+        let rename_all = serde_attributes::extract_serde_attributes(&struct_item.attrs).rename_all;
 
         Some(TypeInfo {
             name: full_path,
@@ -524,6 +671,7 @@ impl RustAnalyzer {
             line,
             column,
             has_default,
+            rename_all,
         })
     }
 
@@ -534,11 +682,7 @@ impl RustAnalyzer {
         file_path: Option<&Path>,
     ) -> Option<TypeInfo> {
         let enum_name = enum_item.ident.to_string();
-        let full_path = if module_prefix.is_empty() {
-            enum_name.clone()
-        } else {
-            format!("{}::{}", module_prefix, enum_name)
-        };
+        let full_path = qualified_name(module_prefix, &enum_name);
 
         let docs = extract_docs(&enum_item.attrs);
 
@@ -546,73 +690,15 @@ impl RustAnalyzer {
             .variants
             .iter()
             .map(|variant| {
-                let variant_name = variant.ident.to_string();
-                let variant_docs = extract_docs(&variant.attrs);
                 let variant_start = variant.ident.span().start();
-                let variant_line = Some(variant_start.line);
-                let variant_column = Some(variant_start.column);
-
-                let fields = match &variant.fields {
-                    Fields::Named(fields) => fields
-                        .named
-                        .iter()
-                        .map(|field| {
-                            let field_name = field.ident.as_ref().unwrap().to_string();
-                            let type_name = type_to_string(&field.ty);
-                            let field_docs = extract_docs(&field.attrs);
-                            let (line, column) = field
-                                .ident
-                                .as_ref()
-                                .map(|i| {
-                                    let start = i.span().start();
-                                    (start.line, start.column)
-                                })
-                                .unzip();
-
-                            let field_attributes =
-                                serde_attributes::extract_serde_field_attributes(field);
-                            let has_default = field_attributes.has_default;
-
-                            FieldInfo {
-                                name: field_name,
-                                type_name,
-                                docs: field_docs,
-                                line,
-                                column,
-                                has_default,
-                            }
-                        })
-                        .collect(),
-                    Fields::Unnamed(fields) => fields
-                        .unnamed
-                        .iter()
-                        .enumerate()
-                        .map(|(i, field)| {
-                            let type_name = type_to_string(&field.ty);
-
-                            let field_attributes =
-                                serde_attributes::extract_serde_field_attributes(field);
-                            let has_default = field_attributes.has_default;
-
-                            FieldInfo {
-                                name: i.to_string(),
-                                type_name,
-                                docs: None,
-                                line: None,
-                                column: None,
-                                has_default,
-                            }
-                        })
-                        .collect(),
-                    Fields::Unit => vec![],
-                };
 
                 EnumVariant {
-                    name: variant_name,
-                    fields,
-                    docs: variant_docs,
-                    line: variant_line,
-                    column: variant_column,
+                    name: variant.ident.to_string(),
+                    fields: extract_fields(&variant.fields),
+                    docs: extract_docs(&variant.attrs),
+                    line: Some(variant_start.line),
+                    column: Some(variant_start.column),
+                    rename: serde_attributes::extract_serde_attributes(&variant.attrs).rename,
                 }
             })
             .collect();
@@ -621,6 +707,7 @@ impl RustAnalyzer {
         let line = Some(start.line);
         let column = Some(start.column);
         let has_default = has_default_derive(&enum_item.attrs);
+        let rename_all = serde_attributes::extract_serde_attributes(&enum_item.attrs).rename_all;
 
         Some(TypeInfo {
             name: full_path,
@@ -630,20 +717,86 @@ impl RustAnalyzer {
             line,
             column,
             has_default,
+            rename_all,
         })
     }
 
     fn extract_type_alias(&mut self, type_item: &ItemType, module_prefix: &str) {
         let alias_name = type_item.ident.to_string();
-        let full_alias_path = if module_prefix.is_empty() {
-            alias_name.clone()
-        } else {
-            format!("{}::{}", module_prefix, alias_name)
-        };
+        let full_alias_path = qualified_name(module_prefix, &alias_name);
 
         let target_type = type_to_string(&type_item.ty);
 
         self.type_aliases.insert(full_alias_path, target_type);
+    }
+}
+
+/// Join a module prefix and a type name into a full path.
+#[cfg(feature = "analyze")]
+fn qualified_name(module_prefix: &str, name: &str) -> String {
+    if module_prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}::{}", module_prefix, name)
+    }
+}
+
+/// Extract FieldInfo entries from struct or enum-variant fields.
+/// Unnamed (tuple) fields are named by their index.
+#[cfg(feature = "analyze")]
+fn extract_fields(fields: &Fields) -> Vec<FieldInfo> {
+    match fields {
+        Fields::Named(fields) => fields
+            .named
+            .iter()
+            .map(|field| {
+                let (line, column) = field
+                    .ident
+                    .as_ref()
+                    .map(|i| {
+                        let start = i.span().start();
+                        (start.line, start.column)
+                    })
+                    .unzip();
+
+                let serde_attrs = serde_attributes::extract_serde_attributes(&field.attrs);
+                FieldInfo {
+                    name: field
+                        .ident
+                        .as_ref()
+                        .expect("named field must have ident")
+                        .to_string(),
+                    type_name: type_to_string(&field.ty),
+                    docs: extract_docs(&field.attrs),
+                    line,
+                    column,
+                    has_default: serde_attrs.has_default,
+                    rename: serde_attrs.rename,
+                    skip: serde_attrs.skip,
+                    flatten: serde_attrs.flatten,
+                }
+            })
+            .collect(),
+        Fields::Unnamed(fields) => fields
+            .unnamed
+            .iter()
+            .enumerate()
+            .map(|(i, field)| {
+                let serde_attrs = serde_attributes::extract_serde_attributes(&field.attrs);
+                FieldInfo {
+                    name: i.to_string(),
+                    type_name: type_to_string(&field.ty),
+                    docs: None,
+                    line: None,
+                    column: None,
+                    has_default: serde_attrs.has_default,
+                    rename: serde_attrs.rename,
+                    skip: serde_attrs.skip,
+                    flatten: serde_attrs.flatten,
+                }
+            })
+            .collect(),
+        Fields::Unit => vec![],
     }
 }
 
@@ -676,19 +829,19 @@ fn extract_docs(attrs: &[syn::Attribute]) -> Option<String> {
 
 #[cfg(feature = "analyze")]
 fn has_default_derive(attrs: &[syn::Attribute]) -> bool {
+    use syn::punctuated::Punctuated;
+    use syn::{Path, Token};
+
     attrs.iter().any(|attr| {
-        if attr.path().is_ident("derive") {
-            // Parse the derive attribute to check for Default
-            if let Ok(meta_list) = attr.meta.require_list() {
-                let tokens_str = meta_list.tokens.to_string();
-                // Check if "Default" appears in the derive list
-                tokens_str.split(',').any(|s| s.trim() == "Default")
-            } else {
-                false
-            }
-        } else {
-            false
-        }
+        attr.path().is_ident("derive")
+            && attr
+                .parse_args_with(Punctuated::<Path, Token![,]>::parse_terminated)
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .any(|p| p.segments.last().is_some_and(|s| s.ident == "Default"))
+                })
+                .unwrap_or(false)
     })
 }
 
@@ -710,31 +863,77 @@ fn type_to_string(ty: &syn::Type) -> String {
 
 #[cfg(feature = "analyze")]
 mod serde_attributes {
-    use syn::Field;
+    use syn::{Attribute, LitStr, Token};
 
-    pub struct SerdeFieldAttributes {
+    #[derive(Default)]
+    pub struct SerdeAttributes {
         pub has_default: bool,
+        pub rename: Option<String>,
+        pub rename_all: Option<String>,
+        pub skip: bool,
+        pub flatten: bool,
     }
 
-    pub fn extract_serde_field_attributes(field: &Field) -> SerdeFieldAttributes {
-        let mut field_attrs = SerdeFieldAttributes { has_default: false };
+    /// Extract serde attributes from a field, variant, or container attribute list.
+    pub fn extract_serde_attributes(attrs: &[Attribute]) -> SerdeAttributes {
+        let mut out = SerdeAttributes::default();
 
-        let attrs = field
-            .attrs
-            .iter()
-            .filter(|attr| attr.path().is_ident("serde"));
-
-        for attr in attrs {
+        for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
             let _ = attr.parse_nested_meta(|meta| {
-                // #[serde(default)]
                 if meta.path.is_ident("default") {
-                    field_attrs.has_default = true;
+                    // #[serde(default)] or #[serde(default = "path")]
+                    out.has_default = true;
+                    if meta.input.peek(Token![=]) {
+                        let _: LitStr = meta.value()?.parse()?;
+                    }
+                } else if meta.path.is_ident("rename") {
+                    if meta.input.peek(Token![=]) {
+                        let lit: LitStr = meta.value()?.parse()?;
+                        out.rename = Some(lit.value());
+                    } else {
+                        // rename(serialize = "...", deserialize = "...")
+                        meta.parse_nested_meta(|inner| {
+                            let lit: LitStr = inner.value()?.parse()?;
+                            if inner.path.is_ident("deserialize") {
+                                out.rename = Some(lit.value());
+                            }
+                            Ok(())
+                        })?;
+                    }
+                } else if meta.path.is_ident("rename_all") {
+                    if meta.input.peek(Token![=]) {
+                        let lit: LitStr = meta.value()?.parse()?;
+                        out.rename_all = Some(lit.value());
+                    } else {
+                        meta.parse_nested_meta(|inner| {
+                            let lit: LitStr = inner.value()?.parse()?;
+                            if inner.path.is_ident("deserialize") {
+                                out.rename_all = Some(lit.value());
+                            }
+                            Ok(())
+                        })?;
+                    }
+                } else if meta.path.is_ident("skip") || meta.path.is_ident("skip_deserializing") {
+                    out.skip = true;
+                } else if meta.path.is_ident("flatten") {
+                    out.flatten = true;
+                } else if meta.input.peek(Token![=]) {
+                    // Consume values of other attributes so parsing continues
+                    let _: syn::Lit = meta.value()?.parse()?;
+                } else if meta.input.peek(syn::token::Paren) {
+                    // Consume parenthesized attributes like bound(...)
+                    meta.parse_nested_meta(|inner| {
+                        if inner.input.peek(Token![=]) {
+                            let _: syn::Lit = inner.value()?.parse()?;
+                        }
+                        Ok(())
+                    })?;
                 }
                 Ok(())
             });
         }
 
-        field_attrs
+        out
     }
 }
 
@@ -754,6 +953,7 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         });
 
         let json = serde_json::to_string(&analyzer).unwrap();
@@ -837,12 +1037,14 @@ mod tests {
                 line: None,
                 column: None,
                 has_default: false,
+                ..Default::default()
             }]),
             docs: Some("My custom type".to_string()),
             source_file: None,
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         };
 
         analyzer.add_type(type_info);
@@ -863,6 +1065,7 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         });
 
         assert!(analyzer.has_type("crate::ToRemove"));
@@ -899,6 +1102,7 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         });
 
         analyzer.add_type_alias("crate::AliasType", "crate::RealType");
@@ -939,6 +1143,7 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         });
 
         // syn's `quote!(#ty).to_string()` produces field type names with
@@ -964,6 +1169,7 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         });
 
         // Should be able to find by simple name
@@ -987,6 +1193,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "name".to_string(),
@@ -995,6 +1202,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -1002,6 +1210,7 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         });
 
         // Add Post type that references User
@@ -1015,6 +1224,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "author".to_string(),
@@ -1023,6 +1233,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "tags".to_string(),
@@ -1031,6 +1242,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -1038,6 +1250,7 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         });
 
         let errors = analyzer.validate_field_types();
@@ -1059,6 +1272,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
                 FieldInfo {
                     name: "author".to_string(),
@@ -1067,6 +1281,7 @@ mod tests {
                     line: None,
                     column: None,
                     has_default: false,
+                    ..Default::default()
                 },
             ]),
             docs: None,
@@ -1074,6 +1289,7 @@ mod tests {
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         });
 
         let errors = analyzer.validate_field_types();
@@ -1097,16 +1313,193 @@ mod tests {
                 line: None,
                 column: None,
                 has_default: false,
+                ..Default::default()
             }]),
             docs: None,
             source_file: None,
             line: None,
             column: None,
             has_default: false,
+            ..Default::default()
         });
 
         let errors = analyzer.validate_field_types();
         assert_eq!(errors.len(), 1, "Should find 1 unknown type in Vec");
         assert_eq!(errors[0].2, "UnknownItem");
+    }
+
+    #[test]
+    fn test_deserialize_pre_0_4_json() {
+        // JSON produced by roniker 0.3.x, before the serde-attribute fields
+        // (rename/skip/flatten/rename_all) existed. Must still deserialize.
+        let json = r#"{
+            "name": "crate::Config",
+            "kind": {
+                "Struct": [{
+                    "name": "debug",
+                    "type_name": "bool",
+                    "docs": null,
+                    "line": 3,
+                    "column": 4,
+                    "has_default": false
+                }]
+            },
+            "docs": null,
+            "source_file": null,
+            "line": 1,
+            "column": 0,
+            "has_default": false
+        }"#;
+        let info: TypeInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.name, "crate::Config");
+        assert_eq!(info.rename_all, None);
+        let fields = info.fields().unwrap();
+        assert_eq!(fields[0].name, "debug");
+        assert_eq!(fields[0].rename, None);
+        assert!(!fields[0].skip);
+        assert!(!fields[0].flatten);
+
+        let variant_json = r#"{
+            "name": "Active",
+            "fields": [],
+            "docs": null,
+            "line": null,
+            "column": null
+        }"#;
+        let variant: EnumVariant = serde_json::from_str(variant_json).unwrap();
+        assert_eq!(variant.name, "Active");
+        assert_eq!(variant.rename, None);
+    }
+
+    #[test]
+    fn test_extract_serde_attributes() {
+        let mut analyzer = RustAnalyzer::new();
+        analyzer
+            .add_source_with_prefix(
+                "crate",
+                r#"
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                pub struct Config {
+                    pub max_connections: u32,
+                    #[serde(rename = "kind")]
+                    pub config_kind: String,
+                    #[serde(default = "default_timeout")]
+                    pub timeout_ms: u64,
+                    #[serde(skip)]
+                    pub runtime_state: String,
+                    #[serde(flatten)]
+                    pub extra: Extra,
+                }
+
+                #[derive(serde::Deserialize)]
+                pub struct Extra {
+                    pub verbose: bool,
+                }
+
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "snake_case")]
+                pub enum Mode {
+                    FastMode,
+                    #[serde(rename = "legacy")]
+                    OldMode,
+                }
+                "#,
+            )
+            .unwrap();
+
+        let config = analyzer.get_type_info("crate::Config").unwrap();
+        assert_eq!(config.rename_all.as_deref(), Some("camelCase"));
+
+        let kind = config.find_field("config_kind").unwrap();
+        assert_eq!(kind.rename.as_deref(), Some("kind"));
+
+        let timeout = config.find_field("timeout_ms").unwrap();
+        assert!(timeout.has_default, "default = \"path\" sets has_default");
+
+        assert!(config.find_field("runtime_state").unwrap().skip);
+        assert!(config.find_field("extra").unwrap().flatten);
+
+        let mode = analyzer.get_type_info("crate::Mode").unwrap();
+        assert_eq!(mode.rename_all.as_deref(), Some("snake_case"));
+        let old = mode.find_variant("OldMode").unwrap();
+        assert_eq!(old.rename.as_deref(), Some("legacy"));
+
+        // Serialized-name resolution built on the extracted attributes
+        assert_eq!(
+            config
+                .find_field("max_connections")
+                .unwrap()
+                .serialized_name(config.rename_all.as_deref()),
+            "maxConnections"
+        );
+        assert_eq!(
+            kind.serialized_name(config.rename_all.as_deref()),
+            "kind",
+            "explicit rename overrides rename_all"
+        );
+        assert_eq!(old.serialized_name(mode.rename_all.as_deref()), "legacy");
+        assert_eq!(
+            mode.find_variant("FastMode")
+                .unwrap()
+                .serialized_name(mode.rename_all.as_deref()),
+            "fast_mode"
+        );
+
+        // Lookup by serialized name, with Rust-name fallback
+        assert!(config.find_field_serialized("maxConnections").is_some());
+        assert!(config.find_field_serialized("max_connections").is_some());
+        assert!(mode.find_variant_serialized("fast_mode").is_some());
+        assert!(mode.find_variant_serialized("legacy").is_some());
+
+        // effective_fields: skip excluded, flatten expanded, names serialized
+        let effective = config.effective_fields(&analyzer);
+        let names: Vec<&str> = effective.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["maxConnections", "kind", "timeoutMs", "verbose"]);
+        assert!(!config.has_unresolved_flatten(&analyzer));
+
+        let config = config.clone();
+        analyzer.remove_type("crate::Extra");
+        assert!(config.has_unresolved_flatten(&analyzer));
+    }
+
+    #[test]
+    fn test_rename_all_matches_serde_json() {
+        // Cross-check our rename_all implementation against serde itself.
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CamelFields {
+            max_connections: u32,
+            single: bool,
+        }
+
+        let value = serde_json::to_value(CamelFields {
+            max_connections: 1,
+            single: true,
+        })
+        .unwrap();
+        let object = value.as_object().unwrap();
+        for rust_name in ["max_connections", "single"] {
+            assert!(object.contains_key(&rename_all_field(rust_name, "camelCase")));
+        }
+
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "kebab-case")]
+        enum KebabModes {
+            FastMode,
+            SlowIoMode,
+        }
+
+        for (variant, rust_name) in [(KebabModes::FastMode, "FastMode"), (KebabModes::SlowIoMode, "SlowIoMode")] {
+            let value = serde_json::to_value(variant).unwrap();
+            assert_eq!(
+                value.as_str().unwrap(),
+                rename_all_variant(rust_name, "kebab-case")
+            );
+        }
+
+        assert_eq!(rename_all_variant("FastMode", "SCREAMING_SNAKE_CASE"), "FAST_MODE");
+        assert_eq!(rename_all_field("max_size", "PascalCase"), "MaxSize");
+        assert_eq!(rename_all_field("max_size", "SCREAMING-KEBAB-CASE"), "MAX-SIZE");
     }
 }
