@@ -14,6 +14,7 @@ readme = "README.md"
 anyhow = "1"
 ron = "0.12"
 serde = { version = "1", features = ["derive"] }
+strsim = { version = "0.11", optional = true }
 
 # For LSP server
 tower-lsp = { version = "0.20", optional = true }
@@ -45,4 +46,5 @@ lsp = [
   "dep:tokio",
   "dep:tree-sitter",
   "dep:ron-lsp-tree-sitter",
+  "dep:strsim",
 ]

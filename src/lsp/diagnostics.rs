@@ -1,8 +1,8 @@
 use super::tree_sitter_parser;
 use super::ts_utils::ParsedEnumVariant;
 use super::type_utils::{
-    extract_inner_type, is_primitive_type, is_std_generic_type, missing_required_fields,
-    short_name,
+    closest_name, extract_inner_type, is_primitive_type, is_std_generic_type,
+    missing_required_fields, short_name,
 };
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use ron::Value;
@@ -24,6 +24,16 @@ pub mod codes {
 
 fn code(code: &str) -> Option<NumberOrString> {
     Some(NumberOrString::String(code.to_string()))
+}
+
+/// Build a `" (did you mean 'x'?)"` suffix when one of `candidates` is a close
+/// match for the misspelled `target`, or an empty string otherwise. The suffix
+/// is meant to be appended directly to a diagnostic message.
+fn did_you_mean<'a>(target: &str, candidates: impl IntoIterator<Item = &'a str>) -> String {
+    match closest_name(target, candidates) {
+        Some(best) => format!(" (did you mean '{}'?)", best),
+        None => String::new(),
+    }
 }
 
 /// Validate RON with access to RustAnalyzer for recursive type lookups
@@ -177,6 +187,11 @@ async fn validate_enum_variant_fields_in_structs(
                         .find(&format!("{}:", field_at_pos))
                         .or_else(|| line.find(&format!("{} :", field_at_pos)))
                     {
+                        let variant_fields = variant.effective_fields();
+                        let suggestion = did_you_mean(
+                            field_at_pos,
+                            variant_fields.iter().map(|(name, _)| name.as_str()),
+                        );
                         diagnostics.push(Diagnostic {
                             range: Range::new(
                                 Position::new(location.line_idx as u32, col as u32),
@@ -187,8 +202,8 @@ async fn validate_enum_variant_fields_in_structs(
                             ),
                             severity: Some(DiagnosticSeverity::ERROR),
                             message: format!(
-                                "Unknown field '{}' in variant '{}'",
-                                field_at_pos, location.variant_name
+                                "Unknown field '{}' in variant '{}'{}",
+                                field_at_pos, location.variant_name, suggestion
                             ),
                             code: code(codes::UNKNOWN_FIELD),
                             ..Default::default()
@@ -367,10 +382,14 @@ async fn validate_struct_fields(
                         }
                         // Unknown field — report at the field name node
                         let range = ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node));
+                        let suggestion = did_you_mean(
+                            field_name,
+                            effective_fields.iter().map(|(name, _)| name.as_str()),
+                        );
                         diagnostics.push(Diagnostic {
                             range,
                             severity: Some(DiagnosticSeverity::ERROR),
-                            message: format!("Unknown field '{}'", field_name),
+                            message: format!("Unknown field '{}'{}", field_name, suggestion),
                             code: code(codes::UNKNOWN_FIELD),
                             ..Default::default()
                         });
@@ -652,6 +671,11 @@ async fn validate_enum_variant_with_fields(
             }
         } else {
             // Variant doesn't exist
+            let variant_names: Vec<String> = variants
+                .iter()
+                .map(|v| v.serialized_name(rename_all))
+                .collect();
+            let suggestion = did_you_mean(&variant.name, variant_names.iter().map(|s| s.as_str()));
             diagnostics.push(Diagnostic {
                 range: Range::new(
                     Position::new(variant.line, variant.col),
@@ -659,8 +683,8 @@ async fn validate_enum_variant_with_fields(
                 ),
                 severity: Some(DiagnosticSeverity::ERROR),
                 message: format!(
-                    "Unknown variant '{}' for enum '{}'",
-                    variant.name, type_info.name
+                    "Unknown variant '{}' for enum '{}'{}",
+                    variant.name, type_info.name, suggestion
                 ),
                 code: code(codes::UNKNOWN_VARIANT),
                 ..Default::default()
@@ -734,10 +758,14 @@ async fn validate_node_with_type_info<'a>(
                         } else if !allow_unknown_fields {
                             // Unknown field
                             let range = ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node));
+                            let suggestion = did_you_mean(
+                                field_name,
+                                effective_fields.iter().map(|(name, _)| name.as_str()),
+                            );
                             diagnostics.push(Diagnostic {
                                 range,
                                 severity: Some(DiagnosticSeverity::ERROR),
-                                message: format!("Unknown field '{}'", field_name),
+                                message: format!("Unknown field '{}'{}", field_name, suggestion),
                                 code: code(codes::UNKNOWN_FIELD),
                                 ..Default::default()
                             });
@@ -2669,6 +2697,80 @@ PostReference(Post(
                 .iter()
                 .any(|d| d.message.contains("Unknown variant 'bogus_mode'")),
             "Unknown variant should still error. Got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_field_suggests_closest() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![
+                FieldInfo {
+                    name: "ephemeral".to_string(),
+                    type_name: "bool".to_string(),
+                    ..Default::default()
+                },
+                FieldInfo {
+                    name: "timeout".to_string(),
+                    type_name: "u32".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        // A typo in a known field should be reported with a suggestion.
+        let content = "(\n    ephemerl: true,\n)";
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("Unknown field 'ephemerl' (did you mean 'ephemeral'?)")),
+            "Should suggest 'ephemeral'. Got: {:?}",
+            diagnostics
+        );
+
+        // A field bearing no resemblance to any known field gets no suggestion.
+        let content = "(\n    hostname: true,\n)";
+        let diagnostics =
+            validate_ron_with_analyzer(content, None, &type_info, analyzer.clone()).await;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message == "Unknown field 'hostname'"),
+            "Unrelated field should have no suggestion. Got: {:?}",
+            diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_variant_suggests_closest() {
+        let analyzer = Arc::new(RustAnalyzer::new());
+        let type_info = TypeInfo {
+            name: "Mode".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Ephemeral".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Persistent".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let diagnostics =
+            validate_ron_with_analyzer("Ephemerl", None, &type_info, analyzer.clone()).await;
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("(did you mean 'Ephemeral'?)")),
+            "Should suggest 'Ephemeral'. Got: {:?}",
             diagnostics
         );
     }

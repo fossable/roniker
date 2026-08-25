@@ -395,22 +395,6 @@ fn generate_value_completions_by_type(
             insert_text: Some("false".to_string()),
             ..Default::default()
         });
-    } else if clean_type.starts_with("Option<") {
-        completions.push(CompletionItem {
-            label: "Some()".to_string(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: Some("Some variant".to_string()),
-            insert_text: Some("Some($0)".to_string()),
-            insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
-            ..Default::default()
-        });
-        completions.push(CompletionItem {
-            label: "None".to_string(),
-            kind: Some(CompletionItemKind::VALUE),
-            detail: Some("None variant".to_string()),
-            insert_text: Some("None".to_string()),
-            ..Default::default()
-        });
     } else if clean_type.starts_with("Vec<") || clean_type.starts_with("[") {
         completions.push(CompletionItem {
             label: "[]".to_string(),

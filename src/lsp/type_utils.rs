@@ -55,6 +55,53 @@ pub fn is_std_generic_type(type_name: &str) -> bool {
         || clean.starts_with("Arc<")
 }
 
+/// Largest absolute edit distance we ever treat as a plausible typo. Real
+/// misspellings are almost always one or two edits away; beyond that the
+/// "match" is a different word, so suggesting it is just noise.
+const MAX_EDIT_DISTANCE: usize = 2;
+
+/// Optimal String Alignment distance between two strings, compared
+/// case-insensitively. This is Levenshtein extended so that an adjacent
+/// transposition (a very common typo, e.g. `prot` for `port`) costs one edit
+/// instead of two. Used to power "did you mean?" suggestions.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: String = a.chars().flat_map(char::to_lowercase).collect();
+    let b: String = b.chars().flat_map(char::to_lowercase).collect();
+    strsim::osa_distance(&a, &b)
+}
+
+/// Find the candidate most similar to `target` for a "did you mean?" hint.
+///
+/// Returns the closest candidate whose edit distance is small enough to be a
+/// plausible typo. To keep suggestions from becoming noise, the match must be
+/// genuinely close: at most [`MAX_EDIT_DISTANCE`] edits, no more than a third
+/// of the longer name's length, and strictly less than `target`'s length so an
+/// entirely different word is never suggested. The bounds mean very short names
+/// (≤2 chars) only match exactly. Returns `None` when nothing is close enough
+/// or `candidates` is empty; ties break to the first occurrence.
+pub fn closest_name<'a>(
+    target: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    let target_len = target.chars().count();
+    let mut best: Option<(&str, usize)> = None;
+
+    for candidate in candidates {
+        let dist = edit_distance(target, candidate);
+        let longer = target_len.max(candidate.chars().count());
+        let threshold = (longer / 3).min(MAX_EDIT_DISTANCE);
+
+        if dist <= threshold
+            && dist < target_len
+            && best.is_none_or(|(_, best_dist)| dist < best_dist)
+        {
+            best = Some((candidate, dist));
+        }
+    }
+
+    best.map(|(name, _)| name)
+}
+
 /// Fields that must be present in the RON: not `Option<T>`, no default.
 /// Takes `(serialized_name, field)` pairs (see `TypeInfo::effective_fields` /
 /// `EnumVariant::effective_fields`); a field counts as present under either
@@ -96,5 +143,43 @@ mod tests {
         assert_eq!(innermost_generic("Option<Post>"), "Post");
         assert_eq!(innermost_generic("Vec < Post >"), "Post");
         assert_eq!(innermost_generic("Post"), "Post");
+    }
+
+    #[test]
+    fn test_edit_distance() {
+        assert_eq!(edit_distance("name", "name"), 0);
+        assert_eq!(edit_distance("nam", "name"), 1);
+        assert_eq!(edit_distance("Name", "name"), 0); // case-insensitive
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn test_closest_name_suggests_typo() {
+        let fields = ["ephemeral", "database", "timeout"];
+        assert_eq!(closest_name("ephemerl", fields), Some("ephemeral"));
+        assert_eq!(closest_name("databse", fields), Some("database"));
+        // Case-only difference is still a match.
+        assert_eq!(closest_name("Timeout", fields), Some("timeout"));
+    }
+
+    #[test]
+    fn test_closest_name_rejects_unrelated() {
+        let fields = ["ephemeral", "database", "timeout"];
+        // Nothing close enough to be a plausible typo.
+        assert_eq!(closest_name("hostname", fields), None);
+        // A completely different short word should not match a short candidate.
+        assert_eq!(closest_name("id", ["ip"]), None);
+        // No candidates.
+        assert_eq!(closest_name("anything", std::iter::empty()), None);
+        // Three edits on a long name: within the old length/3 bound but past
+        // the absolute cap, so it is no longer treated as a plausible typo.
+        assert_eq!(closest_name("abcdefXYZj", ["abcdefghij"]), None);
+    }
+
+    #[test]
+    fn test_closest_name_picks_nearest() {
+        // "prot" is one edit from "port" but two from "protocol"; pick the nearest.
+        assert_eq!(closest_name("prot", ["port", "protocol"]), Some("port"));
     }
 }
