@@ -1,8 +1,8 @@
 use super::tree_sitter_parser;
 use super::ts_utils::ParsedEnumVariant;
 use super::type_utils::{
-    closest_name, extract_inner_type, is_primitive_type, is_std_generic_type,
-    missing_required_fields, short_name,
+    closest_name, extract_inner_type, is_custom_type, is_primitive_type, missing_required_fields,
+    short_name,
 };
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use ron::Value;
@@ -544,7 +544,7 @@ async fn validate_field_value_node<'a>(
 
     if let Some(inner_type) = extract_inner_type(&field_type_normalized, "Vec<") {
         // Vec<CustomType> — validate every array element against the inner type
-        if !is_primitive_type(inner_type) && !is_std_generic_type(inner_type) {
+        if is_custom_type(inner_type) {
             if let Some(inner_type_info) = analyzer.get_type_info(inner_type).cloned() {
                 if value_node.kind() == "array" {
                     let mut cursor = value_node.walk();
@@ -573,7 +573,7 @@ async fn validate_field_value_node<'a>(
         .find_map(|w| extract_inner_type(&field_type_normalized, w))
     {
         // Single-element wrapper — check the inner type is known
-        if !is_primitive_type(inner_type) && !is_std_generic_type(inner_type) {
+        if is_custom_type(inner_type) {
             if let Some(inner_type_info) = analyzer.get_type_info(inner_type).cloned() {
                 let nested_diags = Box::pin(validate_node_with_type_info(
                     value_node,
@@ -587,9 +587,7 @@ async fn validate_field_value_node<'a>(
                 diagnostics.push(unknown_type_diag(inner_type));
             }
         }
-    } else if !is_primitive_type(&field_type_normalized)
-        && !is_std_generic_type(&field_type_normalized)
-    {
+    } else if is_custom_type(&field_type_normalized) {
         // Plain custom struct/enum — validate the node directly
         if let Some(nested_type_info) = analyzer.get_type_info(&field_type_normalized).cloned() {
             let nested_diags = Box::pin(validate_node_with_type_info(
@@ -823,8 +821,7 @@ async fn validate_variant_field_data(
 
         // Check if it's Vec<CustomType>
         if let Some(inner_type) = extract_inner_type(&normalized_type, "Vec<") {
-            if !is_primitive_type(inner_type)
-                && !is_std_generic_type(inner_type)
+            if is_custom_type(inner_type)
                 && let Some(nested_type_info) = analyzer.get_type_info(inner_type).cloned()
             {
                 // Parse with tree-sitter
@@ -1063,8 +1060,7 @@ async fn check_type_mismatch_with_enum_validation(
     analyzer: &Arc<RustAnalyzer>,
 ) -> Option<String> {
     // If the expected type is custom (not primitive), we need special handling
-    if !is_primitive_type(expected_type)
-        && !is_std_generic_type(expected_type)
+    if is_custom_type(expected_type)
         && let Some(field_value_text) = extract_field_value_text(tree, content, field_name)
     {
         let trimmed = field_value_text.trim();
@@ -1143,7 +1139,7 @@ fn check_type_mismatch_deep(
     let clean_type = expected_type.replace(" ", "");
 
     // First check if it's a primitive type or standard library generic type
-    if is_primitive_type(expected_type) || is_std_generic_type(expected_type) {
+    if !is_custom_type(expected_type) {
         return check_type_mismatch(value, expected_type);
     }
 

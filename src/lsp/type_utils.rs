@@ -55,6 +55,15 @@ pub fn is_std_generic_type(type_name: &str) -> bool {
         || clean.starts_with("Arc<")
 }
 
+/// Check if a type is a user-defined struct or enum — i.e. something the
+/// analyzer should resolve and validate against. This is exactly the types that
+/// are neither a primitive ([`is_primitive_type`]) nor a standard-library
+/// generic wrapper ([`is_std_generic_type`]). Both of those normalize
+/// whitespace internally, so `type_name` may be passed raw or pre-normalized.
+pub fn is_custom_type(type_name: &str) -> bool {
+    !is_primitive_type(type_name) && !is_std_generic_type(type_name)
+}
+
 /// Largest absolute edit distance we ever treat as a plausible typo. Real
 /// misspellings are almost always one or two edits away; beyond that the
 /// "match" is a different word, so suggesting it is just noise.
