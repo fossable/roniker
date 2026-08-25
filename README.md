@@ -24,8 +24,8 @@ The build script reads your config structs and turns them into LSP state that
 can be serialized and embedded into your application:
 
 ```rs
-let mut analyzer = roniker::RustAnalyzer::new("crate::config::Configuration");
-analyzer.add_file(PathBuf::from("src/config.rs"));
+let mut analyzer = roniker::RustAnalyzer::with_root_type("crate::config::Configuration");
+analyzer.add_file(Path::new("src/config.rs"))?;
 
 let json = serde_json::to_string(&analyzer)?;
 let dest = PathBuf::from(std::env::var("OUT_DIR")?).join("rust_analyzer.json");
@@ -52,7 +52,7 @@ pub async fn run_lsp() -> Result<()> {
         "/rust_analyzer.json"
     )))?;
 
-    roniker::serve(rust_analyzer).await;
+    roniker::serve(rust_analyzer, true).await;
     Ok(())
 }
 ```
