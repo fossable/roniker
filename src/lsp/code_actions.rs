@@ -525,21 +525,10 @@ fn generate_field_insertions(
 
     let root = tree.root_node();
 
-    // Try to find struct node even if there's an ERROR (for :: syntax)
-    let main_value = match ts_utils::find_main_value(tree) {
-        Some(v) => v,
-        None => {
-            // Fallback: look for any struct node if main value is ERROR
-            let mut cursor = root.walk();
-            let result = root.children(&mut cursor).find(|n| n.kind() == "struct");
-            match result {
-                Some(s) => s,
-                None => {
-                    return None;
-                }
-            }
-        }
-    };
+    // `find_main_value` returns the first named, non-annotation child of the
+    // root, which already includes any `struct` or `ERROR` node. If it finds
+    // nothing, there is no struct to insert into, so bail out.
+    let main_value = ts_utils::find_main_value(tree)?;
 
     if main_value.kind() != "struct" && main_value.kind() != "ERROR" {
         return None;
