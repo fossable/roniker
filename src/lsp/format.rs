@@ -242,7 +242,7 @@ fn format_struct(
     }
 
     // Check if empty
-    let is_empty = ts_utils::is_empty_structure(node, content);
+    let is_empty = ts_utils::is_empty_structure(node);
 
     if is_empty {
         output.push_str("()");
@@ -426,7 +426,7 @@ fn format_array(
     _inline: bool,
     emitted: &mut HashSet<usize>,
 ) {
-    let is_empty = ts_utils::is_empty_structure(node, content);
+    let is_empty = ts_utils::is_empty_structure(node);
 
     if is_empty {
         output.push_str("[]");
@@ -529,7 +529,7 @@ fn format_map(
     _inline: bool,
     emitted: &mut HashSet<usize>,
 ) {
-    let is_empty = ts_utils::is_empty_structure(node, content);
+    let is_empty = ts_utils::is_empty_structure(node);
 
     if is_empty {
         output.push_str("{}");

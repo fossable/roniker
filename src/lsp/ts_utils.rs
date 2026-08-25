@@ -131,20 +131,15 @@ pub fn children_by_kind<'a>(node: &Node<'a>, kind: &str) -> Vec<Node<'a>> {
 #[cfg(test)]
 pub fn child_by_kind<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
-    
-    node
-        .children(&mut cursor)
+
+    node.children(&mut cursor)
         .find(|child| child.kind() == kind)
 }
 
 /// Get all named children of a node
 pub fn named_children<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
-    let mut results = Vec::new();
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        results.push(child);
-    }
-    results
+    node.named_children(&mut cursor).collect()
 }
 
 /// Get the struct/variant name from a struct node
@@ -258,7 +253,7 @@ pub fn find_main_value(tree: &Tree) -> Option<Node<'_>> {
 }
 
 /// Check if a node represents an empty structure (), [], or {}
-pub fn is_empty_structure(node: &Node, _content: &str) -> bool {
+pub fn is_empty_structure(node: &Node) -> bool {
     match node.kind() {
         "struct" | "array" | "map" | "tuple" => {
             // Check if it has any named children (fields, values, etc.)
@@ -310,13 +305,10 @@ pub fn extract_enum_variant(node: &Node, content: &str) -> Option<ParsedEnumVari
             let text = std::str::from_utf8(full_text).ok()?;
 
             // Find content between first ( and last )
-            if let Some(paren_start) = text.find('(') {
-                if let Some(paren_end) = text.rfind(')') {
-                    let inner = &text[paren_start + 1..paren_end];
-                    Some(inner.to_string())
-                } else {
-                    None
-                }
+            if let Some(paren_start) = text.find('(')
+                && let Some(paren_end) = text.rfind(')')
+            {
+                Some(text[paren_start + 1..paren_end].to_string())
             } else {
                 None
             }
@@ -435,13 +427,14 @@ mod tests {
         if let Some(main) = find_main_value(&tree) {
             let fields = struct_fields(&main);
             if let Some(author_field) = fields.first()
-                && let Some(value) = field_value(author_field) {
-                    let value_text = node_text(&value, content).unwrap();
-                    println!("Author field value: {}", value_text);
-                    assert!(value_text.contains("User("));
-                    assert!(value_text.contains("id: 1"));
-                    assert!(value_text.contains("name: \"Alice\""));
-                }
+                && let Some(value) = field_value(author_field)
+            {
+                let value_text = node_text(&value, content).unwrap();
+                println!("Author field value: {}", value_text);
+                assert!(value_text.contains("User("));
+                assert!(value_text.contains("id: 1"));
+                assert!(value_text.contains("name: \"Alice\""));
+            }
         }
     }
 
