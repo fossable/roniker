@@ -1,5 +1,7 @@
 /// Tree-sitter utilities for RON LSP
 /// This module provides high-level helpers for working with tree-sitter AST nodes
+use std::cell::RefCell;
+
 use tower_lsp::lsp_types::{Position, Range};
 use tree_sitter::{Node, Parser, Tree};
 
@@ -32,6 +34,24 @@ impl Default for RonParser {
     fn default() -> Self {
         Self::new()
     }
+}
+
+thread_local! {
+    // Building a `Parser` allocates and loads the RON grammar via `set_language`,
+    // which is wasteful to repeat on every parse (e.g. once per keystroke through
+    // `Document::apply_change`). Keep one parser per thread and reuse it.
+    static PARSER: RefCell<RonParser> = RefCell::new(RonParser::new());
+}
+
+/// Parse RON content using the thread-local reusable parser.
+pub fn parse(content: &str) -> Option<Tree> {
+    PARSER.with(|parser| parser.borrow_mut().parse(content))
+}
+
+/// Re-parse content reusing a previous (edited) tree for incremental parsing,
+/// backed by the thread-local reusable parser.
+pub fn parse_with(content: &str, old_tree: Option<&Tree>) -> Option<Tree> {
+    PARSER.with(|parser| parser.borrow_mut().parse_with(content, old_tree))
 }
 
 /// Convert LSP Position to byte offset in content

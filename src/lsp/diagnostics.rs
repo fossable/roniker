@@ -50,7 +50,7 @@ pub async fn validate_ron_with_analyzer(
     let local_tree;
     let tree = match tree {
         Some(t) => t,
-        None => match super::ts_utils::RonParser::new().parse(content) {
+        None => match super::ts_utils::parse(content) {
             Some(t) => {
                 local_tree = t;
                 &local_tree
@@ -1200,7 +1200,7 @@ fn extract_field_value_text(tree: Option<&Tree>, content: &str, field_name: &str
     let tree = match tree {
         Some(t) => t,
         None => {
-            local_tree = ts_utils::RonParser::new().parse(content)?;
+            local_tree = ts_utils::parse(content)?;
             &local_tree
         }
     };

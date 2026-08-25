@@ -28,7 +28,7 @@ pub struct Document {
 
 impl Document {
     pub fn new(content: String) -> Self {
-        let tree = ts_utils::RonParser::new().parse(&content);
+        let tree = ts_utils::parse(&content);
         Self { content, tree }
     }
 
@@ -72,7 +72,7 @@ impl Document {
                 new_end_position,
             });
         }
-        self.tree = ts_utils::RonParser::new().parse_with(&self.content, self.tree.as_ref());
+        self.tree = ts_utils::parse_with(&self.content, self.tree.as_ref());
     }
 }
 
