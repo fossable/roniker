@@ -493,7 +493,7 @@ async fn validate_struct_fields(
                 if !missing_fields.is_empty() {
                     let missing_names: Vec<String> =
                         missing_fields.iter().map(|(name, _)| name.clone()).collect();
-                    let (line, col_start, col_end) = find_struct_name_position(tree, content);
+                    let (line, col_start, col_end) = find_struct_name_position(tree);
                     diagnostics.push(Diagnostic {
                         range: Range::new(
                             Position::new(line, col_start),
@@ -1028,9 +1028,8 @@ fn extract_enum_variant_from_text(content: &str) -> Option<ParsedEnumVariant> {
 
 /// Find the position of the struct name in the RON content using tree-sitter
 /// Returns (line, col_start, col_end) where col_start == col_end indicates unnamed struct
-fn find_struct_name_position(tree: &Tree, content: &str) -> (u32, u32, u32) {
+fn find_struct_name_position(tree: &Tree) -> (u32, u32, u32) {
     use super::ts_utils;
-    let _ = content;
 
     if let Some(main_value) = ts_utils::find_main_value(tree)
         && main_value.kind() == "struct"
