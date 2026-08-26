@@ -1241,35 +1241,23 @@ fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
         if matches!(value, Value::Option(None)) {
             return None;
         }
-        // For Some(value), check the inner type
-        if let Value::Option(Some(inner)) = value {
-            // Extract the inner type from Option<InnerType>
-            if let Some(inner_type) = extract_inner_type(&clean_type, "Option<") {
-                return check_type_mismatch(inner, inner_type);
-            }
-        }
-        // Non-Option value for Option type is okay (will be wrapped)
+        // Unwrap Some(value) to its inner value; a bare value is fine too (it
+        // will be wrapped). Either way, validate against Option's inner type.
         if let Some(inner_type) = extract_inner_type(&clean_type, "Option<") {
+            let value = match value {
+                Value::Option(Some(inner)) => inner,
+                other => other,
+            };
             return check_type_mismatch(value, inner_type);
         }
     }
 
     // Handle Box, Rc, Arc - they serialize as just the inner value
-    if clean_type.starts_with("Box<")
-        || clean_type.starts_with("Rc<")
-        || clean_type.starts_with("Arc<")
+    if let Some(inner_type) = ["Box<", "Rc<", "Arc<"]
+        .iter()
+        .find_map(|w| extract_inner_type(&clean_type, w))
     {
-        let wrapper = if clean_type.starts_with("Box<") {
-            "Box<"
-        } else if clean_type.starts_with("Rc<") {
-            "Rc<"
-        } else {
-            "Arc<"
-        };
-
-        if let Some(inner_type) = extract_inner_type(&clean_type, wrapper) {
-            return check_type_mismatch(value, inner_type);
-        }
+        return check_type_mismatch(value, inner_type);
     }
 
     match value {
