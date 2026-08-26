@@ -474,17 +474,9 @@ fn create_explicit_field_type_action(
                 && value_node.kind() == "struct"
                 && ts_utils::struct_name(&value_node, content).is_none()
             {
-                let type_name = field
-                    .type_name
-                    .split("::")
-                    .last()
-                    .unwrap_or(&field.type_name)
-                    .replace(" ", "");
-                let clean_type = if type_name.starts_with("Option<") && type_name.ends_with('>') {
-                    &type_name[7..type_name.len() - 1]
-                } else {
-                    &type_name
-                };
+                let type_name = super::type_utils::short_name(&field.type_name).replace(' ', "");
+                let clean_type = super::type_utils::extract_inner_type(&type_name, "Option<")
+                    .unwrap_or(&type_name);
 
                 let pos = value_node.start_position();
                 let mut changes = std::collections::HashMap::new();
