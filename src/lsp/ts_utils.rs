@@ -100,6 +100,11 @@ pub fn node_text<'a>(node: &Node, content: &'a str) -> Option<&'a str> {
     node.utf8_text(content.as_bytes()).ok()
 }
 
+/// Whether a node is a RON comment (`// ...` line or `/* ... */` block).
+pub fn is_comment(node: &Node) -> bool {
+    matches!(node.kind(), "line_comment" | "block_comment")
+}
+
 /// Find the deepest node at a given position
 pub fn node_at_position<'a>(tree: &'a Tree, content: &str, position: Position) -> Option<Node<'a>> {
     let byte_offset = position_to_byte_offset(content, position);
@@ -261,8 +266,7 @@ pub fn find_main_value(tree: &Tree) -> Option<Node<'_>> {
             if kind != "type_annotation"
                 && kind != "extensions"
                 && kind != "extension"
-                && kind != "line_comment"
-                && kind != "block_comment"
+                && !is_comment(&child)
             {
                 return Some(child);
             }

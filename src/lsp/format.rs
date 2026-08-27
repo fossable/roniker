@@ -24,8 +24,7 @@ fn collect_inner_comments(node: &Node, content: &str) -> Vec<Comment> {
     let children: Vec<_> = node.children(&mut cursor).collect();
 
     for (i, child) in children.iter().enumerate() {
-        let kind = child.kind();
-        if (kind == "line_comment" || kind == "block_comment")
+        if ts_utils::is_comment(child)
             && let Some(text) = ts_utils::node_text(child, content)
         {
             let start_byte = child.start_byte();
@@ -65,7 +64,7 @@ fn is_trailing_comment_in_context(
             continue;
         }
         // Skip other comments
-        if kind == "line_comment" || kind == "block_comment" {
+        if ts_utils::is_comment(sibling) {
             continue;
         }
         // Skip identifiers that are struct names (first child of struct)
@@ -98,8 +97,7 @@ fn collect_top_level_comments(root: &Node, content: &str, main_value: &Node) -> 
     let mut cursor = root.walk();
 
     for child in root.children(&mut cursor) {
-        let kind = child.kind();
-        if (kind == "line_comment" || kind == "block_comment")
+        if ts_utils::is_comment(&child)
             && child.end_byte() <= main_value.start_byte()
             && let Some(text) = ts_utils::node_text(&child, content)
         {
@@ -438,7 +436,7 @@ fn format_array(
     // Get all array elements (named children that aren't comments)
     let elements: Vec<_> = ts_utils::named_children(node)
         .into_iter()
-        .filter(|n| n.kind() != "line_comment" && n.kind() != "block_comment")
+        .filter(|n| !ts_utils::is_comment(n))
         .collect();
 
     let inner_comments = collect_inner_comments(node, content);
@@ -567,7 +565,7 @@ fn format_map(
             // Format map entry (key: value)
             let children: Vec<_> = ts_utils::named_children(entry)
                 .into_iter()
-                .filter(|n| n.kind() != "line_comment" && n.kind() != "block_comment")
+                .filter(|n| !ts_utils::is_comment(n))
                 .collect();
 
             if children.len() >= 2 {
@@ -653,7 +651,7 @@ fn format_tuple(
 
     let elements: Vec<_> = ts_utils::named_children(node)
         .into_iter()
-        .filter(|n| n.kind() != "line_comment" && n.kind() != "block_comment")
+        .filter(|n| !ts_utils::is_comment(n))
         .collect();
 
     let inner_comments = collect_inner_comments(node, content);
