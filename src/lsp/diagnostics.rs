@@ -36,6 +36,29 @@ fn did_you_mean<'a>(target: &str, candidates: impl IntoIterator<Item = &'a str>)
     }
 }
 
+/// Push an "unknown field" diagnostic reported at the field's name node,
+/// appending a "did you mean" suggestion drawn from `effective_fields`.
+fn push_unknown_field(
+    diagnostics: &mut Vec<Diagnostic>,
+    field_node: tree_sitter::Node,
+    field_name: &str,
+    effective_fields: &[(String, FieldInfo)],
+) {
+    // Report at the field name node
+    let range = super::ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node));
+    let suggestion = did_you_mean(
+        field_name,
+        effective_fields.iter().map(|(name, _)| name.as_str()),
+    );
+    diagnostics.push(Diagnostic {
+        range,
+        severity: Some(DiagnosticSeverity::ERROR),
+        message: format!("Unknown field '{}'{}", field_name, suggestion),
+        code: code(codes::UNKNOWN_FIELD),
+        ..Default::default()
+    });
+}
+
 /// Validate RON with access to RustAnalyzer for recursive type lookups
 pub async fn validate_ron_with_analyzer(
     content: &str,
@@ -380,19 +403,12 @@ async fn validate_struct_fields(
                         if allow_unknown_fields {
                             continue;
                         }
-                        // Unknown field — report at the field name node
-                        let range = ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node));
-                        let suggestion = did_you_mean(
+                        push_unknown_field(
+                            &mut diagnostics,
+                            field_node,
                             field_name,
-                            effective_fields.iter().map(|(name, _)| name.as_str()),
+                            &effective_fields,
                         );
-                        diagnostics.push(Diagnostic {
-                            range,
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            message: format!("Unknown field '{}'{}", field_name, suggestion),
-                            code: code(codes::UNKNOWN_FIELD),
-                            ..Default::default()
-                        });
                     }
                     Some(field_info) => {
                         present_field_names.push(field_name);
@@ -754,19 +770,12 @@ async fn validate_node_with_type_info<'a>(
                                 diagnostics.extend(field_diags);
                             }
                         } else if !allow_unknown_fields {
-                            // Unknown field
-                            let range = ts_utils::node_to_lsp_range(&field_node.child(0).unwrap_or(field_node));
-                            let suggestion = did_you_mean(
+                            push_unknown_field(
+                                &mut diagnostics,
+                                field_node,
                                 field_name,
-                                effective_fields.iter().map(|(name, _)| name.as_str()),
+                                &effective_fields,
                             );
-                            diagnostics.push(Diagnostic {
-                                range,
-                                severity: Some(DiagnosticSeverity::ERROR),
-                                message: format!("Unknown field '{}'{}", field_name, suggestion),
-                                code: code(codes::UNKNOWN_FIELD),
-                                ..Default::default()
-                            });
                         }
                     }
                 }
