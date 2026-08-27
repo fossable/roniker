@@ -114,6 +114,89 @@ fn collect_top_level_comments(root: &Node, content: &str, main_value: &Node) -> 
     comments
 }
 
+/// Emit any not-yet-emitted leading (non-trailing) comments that fall before
+/// `items[i]` and after the previous item. The struct, array, and map
+/// formatters all lay leading comments out identically; this is that shared
+/// logic. Comments are indented one level deeper than `indent_level`.
+fn emit_leading_comments(
+    output: &mut String,
+    comments: &[Comment],
+    emitted: &mut HashSet<usize>,
+    items: &[Node<'_>],
+    i: usize,
+    indent_str: &str,
+    indent_level: usize,
+) {
+    let item = &items[i];
+    for comment in comments {
+        if emitted.contains(&comment.start_byte) {
+            continue;
+        }
+        if !comment.is_trailing
+            && comment.end_byte <= item.start_byte()
+            && (i == 0 || comment.start_byte > items[i - 1].end_byte())
+        {
+            output.push_str(&indent_str.repeat(indent_level + 1));
+            output.push_str(&comment.text);
+            output.push('\n');
+            emitted.insert(comment.start_byte);
+        }
+    }
+}
+
+/// Emit the single trailing comment (if any) that belongs after `items[i]` and
+/// before the next item. At most one comment is emitted.
+fn emit_trailing_comment(
+    output: &mut String,
+    comments: &[Comment],
+    emitted: &mut HashSet<usize>,
+    items: &[Node<'_>],
+    i: usize,
+) {
+    let item = &items[i];
+    for comment in comments {
+        if emitted.contains(&comment.start_byte) {
+            continue;
+        }
+        if comment.is_trailing && comment.start_byte > item.end_byte() {
+            let next_start = items.get(i + 1).map(|n| n.start_byte());
+            let is_before_next = next_start.map(|s| comment.end_byte <= s).unwrap_or(true);
+            if is_before_next {
+                output.push(' ');
+                output.push_str(&comment.text);
+                emitted.insert(comment.start_byte);
+                break;
+            }
+        }
+    }
+}
+
+/// Emit any not-yet-emitted, non-trailing comments that follow the last item in
+/// a container.
+fn emit_remaining_comments(
+    output: &mut String,
+    comments: &[Comment],
+    emitted: &mut HashSet<usize>,
+    items: &[Node<'_>],
+    indent_str: &str,
+    indent_level: usize,
+) {
+    let Some(last) = items.last() else {
+        return;
+    };
+    for comment in comments {
+        if emitted.contains(&comment.start_byte) {
+            continue;
+        }
+        if comment.start_byte > last.end_byte() && !comment.is_trailing {
+            output.push_str(&indent_str.repeat(indent_level + 1));
+            output.push_str(&comment.text);
+            output.push('\n');
+            emitted.insert(comment.start_byte);
+        }
+    }
+}
+
 /// Format RON content using tree-sitter AST, preserving comments
 pub fn format_ron(content: &str) -> String {
     let indent_str = "    "; // 4 spaces
@@ -260,21 +343,15 @@ fn format_struct(
         output.push('\n');
 
         for (i, field) in fields.iter().enumerate() {
-            // Emit any leading comments that come before this field
-            for comment in &inner_comments {
-                if emitted.contains(&comment.start_byte) {
-                    continue;
-                }
-                if !comment.is_trailing
-                    && comment.end_byte <= field.start_byte()
-                    && (i == 0 || comment.start_byte > fields[i - 1].end_byte())
-                {
-                    output.push_str(&indent_str.repeat(indent_level + 1));
-                    output.push_str(&comment.text);
-                    output.push('\n');
-                    emitted.insert(comment.start_byte);
-                }
-            }
+            emit_leading_comments(
+                output,
+                &inner_comments,
+                emitted,
+                &fields,
+                i,
+                indent_str,
+                indent_level,
+            );
 
             output.push_str(&indent_str.repeat(indent_level + 1));
             format_field(
@@ -289,43 +366,19 @@ fn format_struct(
             // Add comma after each field
             output.push(',');
 
-            // Emit trailing comments for this field
-            for comment in &inner_comments {
-                if emitted.contains(&comment.start_byte) {
-                    continue;
-                }
-                if comment.is_trailing && comment.start_byte > field.end_byte() {
-                    // Check it's on the same "logical" position (before next field or end)
-                    let next_field_start = fields.get(i + 1).map(|f| f.start_byte());
-                    let is_before_next = next_field_start
-                        .map(|s| comment.end_byte <= s)
-                        .unwrap_or(true);
-                    if is_before_next {
-                        output.push(' ');
-                        output.push_str(&comment.text);
-                        emitted.insert(comment.start_byte);
-                        break; // Only one trailing comment per field
-                    }
-                }
-            }
+            emit_trailing_comment(output, &inner_comments, emitted, &fields, i);
 
             output.push('\n');
         }
 
-        // Emit any remaining comments after the last field (non-trailing)
-        if let Some(last_field) = fields.last() {
-            for comment in &inner_comments {
-                if emitted.contains(&comment.start_byte) {
-                    continue;
-                }
-                if comment.start_byte > last_field.end_byte() && !comment.is_trailing {
-                    output.push_str(&indent_str.repeat(indent_level + 1));
-                    output.push_str(&comment.text);
-                    output.push('\n');
-                    emitted.insert(comment.start_byte);
-                }
-            }
-        }
+        emit_remaining_comments(
+            output,
+            &inner_comments,
+            emitted,
+            &fields,
+            indent_str,
+            indent_level,
+        );
 
         output.push_str(&indent_str.repeat(indent_level));
     } else if !values.is_empty() {
@@ -338,21 +391,15 @@ fn format_struct(
 
         for (i, child) in values.iter().enumerate() {
             if !should_inline {
-                // Emit leading comments
-                for comment in &inner_comments {
-                    if emitted.contains(&comment.start_byte) {
-                        continue;
-                    }
-                    if !comment.is_trailing
-                        && comment.end_byte <= child.start_byte()
-                        && (i == 0 || comment.start_byte > values[i - 1].end_byte())
-                    {
-                        output.push_str(&indent_str.repeat(indent_level + 1));
-                        output.push_str(&comment.text);
-                        output.push('\n');
-                        emitted.insert(comment.start_byte);
-                    }
-                }
+                emit_leading_comments(
+                    output,
+                    &inner_comments,
+                    emitted,
+                    &values,
+                    i,
+                    indent_str,
+                    indent_level,
+                );
                 output.push_str(&indent_str.repeat(indent_level + 1));
             }
             format_node(
@@ -444,21 +491,15 @@ fn format_array(
         output.push('\n');
 
         for (i, element) in elements.iter().enumerate() {
-            // Emit leading comments before this element
-            for comment in &inner_comments {
-                if emitted.contains(&comment.start_byte) {
-                    continue;
-                }
-                if !comment.is_trailing
-                    && comment.end_byte <= element.start_byte()
-                    && (i == 0 || comment.start_byte > elements[i - 1].end_byte())
-                {
-                    output.push_str(&indent_str.repeat(indent_level + 1));
-                    output.push_str(&comment.text);
-                    output.push('\n');
-                    emitted.insert(comment.start_byte);
-                }
-            }
+            emit_leading_comments(
+                output,
+                &inner_comments,
+                emitted,
+                &elements,
+                i,
+                indent_str,
+                indent_level,
+            );
 
             output.push_str(&indent_str.repeat(indent_level + 1));
             format_node(
@@ -473,42 +514,19 @@ fn format_array(
 
             output.push(',');
 
-            // Emit trailing comments for this element
-            for comment in &inner_comments {
-                if emitted.contains(&comment.start_byte) {
-                    continue;
-                }
-                if comment.is_trailing && comment.start_byte > element.end_byte() {
-                    let next_elem_start = elements.get(i + 1).map(|e| e.start_byte());
-                    let is_before_next = next_elem_start
-                        .map(|s| comment.end_byte <= s)
-                        .unwrap_or(true);
-                    if is_before_next {
-                        output.push(' ');
-                        output.push_str(&comment.text);
-                        emitted.insert(comment.start_byte);
-                        break;
-                    }
-                }
-            }
+            emit_trailing_comment(output, &inner_comments, emitted, &elements, i);
 
             output.push('\n');
         }
 
-        // Emit any remaining comments after the last element
-        if let Some(last) = elements.last() {
-            for comment in &inner_comments {
-                if emitted.contains(&comment.start_byte) {
-                    continue;
-                }
-                if comment.start_byte > last.end_byte() && !comment.is_trailing {
-                    output.push_str(&indent_str.repeat(indent_level + 1));
-                    output.push_str(&comment.text);
-                    output.push('\n');
-                    emitted.insert(comment.start_byte);
-                }
-            }
-        }
+        emit_remaining_comments(
+            output,
+            &inner_comments,
+            emitted,
+            &elements,
+            indent_str,
+            indent_level,
+        );
 
         output.push_str(&indent_str.repeat(indent_level));
     }
@@ -543,21 +561,15 @@ fn format_map(
         output.push('\n');
 
         for (i, entry) in entries.iter().enumerate() {
-            // Emit leading comments before this entry
-            for comment in &inner_comments {
-                if emitted.contains(&comment.start_byte) {
-                    continue;
-                }
-                if !comment.is_trailing
-                    && comment.end_byte <= entry.start_byte()
-                    && (i == 0 || comment.start_byte > entries[i - 1].end_byte())
-                {
-                    output.push_str(&indent_str.repeat(indent_level + 1));
-                    output.push_str(&comment.text);
-                    output.push('\n');
-                    emitted.insert(comment.start_byte);
-                }
-            }
+            emit_leading_comments(
+                output,
+                &inner_comments,
+                emitted,
+                &entries,
+                i,
+                indent_str,
+                indent_level,
+            );
 
             output.push_str(&indent_str.repeat(indent_level + 1));
 
@@ -593,42 +605,19 @@ fn format_map(
 
             output.push(',');
 
-            // Emit trailing comments for this entry
-            for comment in &inner_comments {
-                if emitted.contains(&comment.start_byte) {
-                    continue;
-                }
-                if comment.is_trailing && comment.start_byte > entry.end_byte() {
-                    let next_entry_start = entries.get(i + 1).map(|e| e.start_byte());
-                    let is_before_next = next_entry_start
-                        .map(|s| comment.end_byte <= s)
-                        .unwrap_or(true);
-                    if is_before_next {
-                        output.push(' ');
-                        output.push_str(&comment.text);
-                        emitted.insert(comment.start_byte);
-                        break;
-                    }
-                }
-            }
+            emit_trailing_comment(output, &inner_comments, emitted, &entries, i);
 
             output.push('\n');
         }
 
-        // Emit any remaining comments after the last entry
-        if let Some(last) = entries.last() {
-            for comment in &inner_comments {
-                if emitted.contains(&comment.start_byte) {
-                    continue;
-                }
-                if comment.start_byte > last.end_byte() && !comment.is_trailing {
-                    output.push_str(&indent_str.repeat(indent_level + 1));
-                    output.push_str(&comment.text);
-                    output.push('\n');
-                    emitted.insert(comment.start_byte);
-                }
-            }
-        }
+        emit_remaining_comments(
+            output,
+            &inner_comments,
+            emitted,
+            &entries,
+            indent_str,
+            indent_level,
+        );
 
         output.push_str(&indent_str.repeat(indent_level));
     }
