@@ -825,10 +825,9 @@ async fn validate_variant_field_data(
                 && let Some(nested_type_info) = analyzer.get_type_info(inner_type).cloned()
             {
                 // Parse with tree-sitter
-                use super::ts_utils::{self, RonParser};
-                let mut parser = RonParser::new();
+                use super::ts_utils;
 
-                if let Some(tree) = parser.parse(data)
+                if let Some(tree) = ts_utils::parse(data)
                     && let Some(array_node) = ts_utils::find_main_value(&tree)
                     && array_node.kind() == "array"
                 {

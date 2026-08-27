@@ -1,6 +1,6 @@
 /// Tree-sitter based RON formatter with comment preservation
 /// This formatter uses the AST to properly handle formatting while preserving comments
-use super::ts_utils::{self, RonParser};
+use super::ts_utils;
 use std::collections::HashSet;
 use tree_sitter::Node;
 
@@ -118,8 +118,7 @@ fn collect_top_level_comments(root: &Node, content: &str, main_value: &Node) -> 
 pub fn format_ron(content: &str) -> String {
     let indent_str = "    "; // 4 spaces
 
-    let mut parser = RonParser::new();
-    let tree = match parser.parse(content) {
+    let tree = match ts_utils::parse(content) {
         Some(t) => t,
         None => {
             // If parsing fails, return original content
