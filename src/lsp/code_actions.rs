@@ -626,16 +626,33 @@ fn generate_default_value(type_name: &str) -> String {
         "{}".to_string()
     } else if clean == "String" || clean == "&str" || clean == "str" {
         "\"\"".to_string()
-    } else if clean
-        .chars()
-        .all(|c| c.is_numeric() || c == 'i' || c == 'u' || c == 'f')
-    {
-        // Numeric types
+    } else if is_numeric_type(&clean) {
+        // Numeric types default to zero
         "0".to_string()
     } else {
         // Custom type - use constructor notation with placeholder
         format!("{}()", clean)
     }
+}
+
+/// Whether a cleaned type name is a Rust numeric primitive.
+fn is_numeric_type(clean: &str) -> bool {
+    matches!(
+        clean,
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+    )
 }
 
 #[cfg(test)]
@@ -646,6 +663,27 @@ mod tests {
         super::super::ts_utils::RonParser::new().parse(content).unwrap()
     }
     use crate::rust_analyzer::TypeKind;
+
+    #[test]
+    fn test_generate_default_value() {
+        assert_eq!(generate_default_value("bool"), "false");
+        assert_eq!(generate_default_value("String"), "\"\"");
+        assert_eq!(generate_default_value("Option<u32>"), "None");
+        assert_eq!(generate_default_value("Vec<u8>"), "[]");
+        assert_eq!(generate_default_value("HashMap<String, u32>"), "{}");
+
+        // Every numeric primitive defaults to 0, including the pointer-sized
+        // integers whose names contain non-`iuf` letters.
+        for numeric in [
+            "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+            "f32", "f64",
+        ] {
+            assert_eq!(generate_default_value(numeric), "0", "type: {numeric}");
+        }
+
+        // Unknown/custom types fall back to constructor notation.
+        assert_eq!(generate_default_value("Server"), "Server()");
+    }
 
     #[test]
     fn test_explicit_root_type_same_line() {
