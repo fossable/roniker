@@ -527,19 +527,12 @@ async fn validate_field_value_node<'a>(
     let field_type_normalized = field_type.replace(" ", "");
 
     // Helper closure to emit an "Unknown type" diagnostic at the value node
-    let unknown_type_diag = |inner: &str| {
-        let start = value_node.start_position();
-        let end = value_node.end_position();
-        Diagnostic {
-            range: Range::new(
-                Position::new(start.row as u32, start.column as u32),
-                Position::new(end.row as u32, end.column as u32),
-            ),
-            severity: Some(DiagnosticSeverity::ERROR),
-            message: format!("Unknown type '{}'", inner),
-            code: code(codes::UNKNOWN_TYPE),
-            ..Default::default()
-        }
+    let unknown_type_diag = |inner: &str| Diagnostic {
+        range: super::ts_utils::node_to_lsp_range(value_node),
+        severity: Some(DiagnosticSeverity::ERROR),
+        message: format!("Unknown type '{}'", inner),
+        code: code(codes::UNKNOWN_TYPE),
+        ..Default::default()
     };
 
     if let Some(inner_type) = extract_inner_type(&field_type_normalized, "Vec<") {
@@ -600,16 +593,8 @@ async fn validate_field_value_node<'a>(
             diagnostics.extend(nested_diags);
         } else {
             // Unknown custom type — report an error at the value node
-            let range = {
-                let start = value_node.start_position();
-                let end = value_node.end_position();
-                Range::new(
-                    Position::new(start.row as u32, start.column as u32),
-                    Position::new(end.row as u32, end.column as u32),
-                )
-            };
             diagnostics.push(Diagnostic {
-                range,
+                range: super::ts_utils::node_to_lsp_range(value_node),
                 severity: Some(DiagnosticSeverity::ERROR),
                 message: format!("Unknown type '{}'", field_type_normalized),
                 code: code(codes::UNKNOWN_TYPE),
