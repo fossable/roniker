@@ -1,4 +1,4 @@
-use super::ts_utils::{node_at_position, struct_name};
+use super::ts_utils::{field_name, node_at_position, struct_name};
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Tree};
 
@@ -45,14 +45,8 @@ pub fn get_field_at_position(tree: &Tree, content: &str, position: Position) -> 
     // Walk up to find a field node
     let mut current = node_at_position(tree, content, position)?;
     loop {
-        if current.kind() == "field" {
-            // The first child of a field node is the identifier (field name)
-            if let Some(field_name_node) = current.child(0)
-                && field_name_node.kind() == "identifier"
-            {
-                let field_name = field_name_node.utf8_text(content.as_bytes()).ok()?;
-                return Some(field_name.to_string());
-            }
+        if let Some(name) = field_name(&current, content) {
+            return Some(name.to_string());
         }
 
         match current.parent() {
@@ -108,11 +102,8 @@ pub fn get_containing_field_context(
         if current.kind() == "field" {
             if found_current_field {
                 // This is the containing field - extract its name
-                if let Some(field_name_node) = current.child(0)
-                    && field_name_node.kind() == "identifier"
-                    && let Ok(field_name) = field_name_node.utf8_text(content.as_bytes())
-                {
-                    return Some(field_name.to_string());
+                if let Some(name) = field_name(&current, content) {
+                    return Some(name.to_string());
                 }
             } else {
                 // This is the first field we found (the one we're in)
@@ -186,11 +177,7 @@ fn visit_fields(node: &Node, content: &str, locations: &mut Vec<VariantFieldLoca
 fn find_parent_field_name(node: &Node, content: &str) -> Option<String> {
     let mut current = *node;
     while let Some(parent) = current.parent() {
-        if parent.kind() == "field"
-            && let Some(field_name_node) = parent.child(0)
-            && field_name_node.kind() == "identifier"
-            && let Ok(name) = field_name_node.utf8_text(content.as_bytes())
-        {
+        if let Some(name) = field_name(&parent, content) {
             return Some(name.to_string());
         }
         current = parent;
@@ -212,18 +199,7 @@ fn collect_fields_in_node(
             let line_idx = child.start_position().row;
 
             // Extract field name
-            let field_at_position = if let Some(field_name_node) = child.child(0) {
-                if field_name_node.kind() == "identifier" {
-                    field_name_node
-                        .utf8_text(content.as_bytes())
-                        .ok()
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            let field_at_position = field_name(&child, content).map(|s| s.to_string());
 
             if let Some(containing_field) = containing_field_name {
                 locations.push(VariantFieldLocation {
@@ -272,12 +248,8 @@ fn collect_direct_field_names(
 ) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "field"
-            && let Some(field_name_node) = child.child(0)
-            && field_name_node.kind() == "identifier"
-            && let Ok(field_name) = field_name_node.utf8_text(content.as_bytes())
-        {
-            fields.insert(field_name.to_string());
+        if let Some(name) = field_name(&child, content) {
+            fields.insert(name.to_string());
         }
     }
 }
