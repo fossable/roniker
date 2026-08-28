@@ -1,5 +1,5 @@
 use super::tree_sitter_parser;
-use super::type_utils::{extract_inner_type, innermost_generic, short_name};
+use super::type_utils::{extract_inner_type, short_name, strip_outer_generic};
 use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
@@ -237,7 +237,7 @@ fn generate_type_completions_for_field(
     // Find the field in the type info (by serialized or Rust name)
     if let Some(field) = type_info.find_field_serialized(&field_name) {
         // Get the inner type if it's a generic
-        let inner_type = innermost_generic(&field.type_name);
+        let inner_type = strip_outer_generic(&field.type_name);
 
         // Try to get type info for this type
         if let Some(nested_type) = analyzer.get_type_info(&inner_type) {

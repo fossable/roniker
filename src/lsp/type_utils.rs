@@ -19,7 +19,7 @@ pub fn extract_inner_type<'a>(type_str: &'a str, wrapper: &str) -> Option<&'a st
 
 /// Get the content of the outermost generic (e.g., `Option<Vec<T>>` -> `Vec<T>`),
 /// or the type itself if it isn't generic. Whitespace is removed.
-pub fn innermost_generic(type_name: &str) -> String {
+pub fn strip_outer_generic(type_name: &str) -> String {
     let clean = type_name.replace(' ', "");
     match (clean.find('<'), clean.rfind('>')) {
         (Some(start), Some(end)) if start < end => clean[start + 1..end].to_string(),
@@ -148,10 +148,12 @@ mod tests {
     }
 
     #[test]
-    fn test_innermost_generic() {
-        assert_eq!(innermost_generic("Option<Post>"), "Post");
-        assert_eq!(innermost_generic("Vec < Post >"), "Post");
-        assert_eq!(innermost_generic("Post"), "Post");
+    fn test_strip_outer_generic() {
+        assert_eq!(strip_outer_generic("Option<Post>"), "Post");
+        assert_eq!(strip_outer_generic("Vec < Post >"), "Post");
+        assert_eq!(strip_outer_generic("Post"), "Post");
+        // Only the outermost layer is stripped.
+        assert_eq!(strip_outer_generic("Option<Vec<Post>>"), "Vec<Post>");
     }
 
     #[test]
