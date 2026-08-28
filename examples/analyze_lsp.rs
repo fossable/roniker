@@ -19,14 +19,17 @@ fn main() {
         .add_file(&config_path)
         .expect("Failed to parse config_types.rs");
 
-    // Verify the types were parsed
-    println!("Parsed types:");
+    // Verify the types were parsed. These informational lines go to stderr:
+    // `serve` speaks the LSP protocol over stdin/stdout, so anything written to
+    // stdout here would be prepended to the JSON-RPC stream and corrupt it for a
+    // connecting editor.
+    eprintln!("Parsed types:");
     for type_info in analyzer.get_all_types() {
-        println!("  - {}: {:?}", type_info.name, type_info.docs);
+        eprintln!("  - {}: {:?}", type_info.name, type_info.docs);
     }
 
-    println!("\nStarting LSP server on stdin/stdout...");
-    println!("Configure your editor to use this as a language server for .ron files.");
+    eprintln!("\nStarting LSP server on stdin/stdout...");
+    eprintln!("Configure your editor to use this as a language server for .ron files.");
 
     // Start the LSP server
     tokio::runtime::Runtime::new()
