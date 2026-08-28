@@ -1,4 +1,4 @@
-use super::ts_utils::{position_to_byte_offset, struct_name};
+use super::ts_utils::{node_at_position, struct_name};
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Tree};
 
@@ -16,14 +16,8 @@ pub fn find_type_context_at_position(
     content: &str,
     position: Position,
 ) -> Vec<TypeContext> {
-    let root = tree.root_node();
-    let byte_offset = position_to_byte_offset(content, position);
-
-    // Find the node at the cursor position
-    let node = root.descendant_for_byte_range(byte_offset, byte_offset);
-
     let mut contexts = Vec::new();
-    if let Some(mut current) = node {
+    if let Some(mut current) = node_at_position(tree, content, position) {
         // Walk up the tree to collect all struct contexts
         loop {
             if current.kind() == "struct"
@@ -48,14 +42,8 @@ pub fn find_type_context_at_position(
 
 /// Get the field name at a specific position in RON content using tree-sitter
 pub fn get_field_at_position(tree: &Tree, content: &str, position: Position) -> Option<String> {
-    let root = tree.root_node();
-    let byte_offset = position_to_byte_offset(content, position);
-
-    // Find the node at the cursor position
-    let node = root.descendant_for_byte_range(byte_offset, byte_offset)?;
-
     // Walk up to find a field node
-    let mut current = node;
+    let mut current = node_at_position(tree, content, position)?;
     loop {
         if current.kind() == "field" {
             // The first child of a field node is the identifier (field name)
@@ -82,14 +70,8 @@ pub fn find_current_variant_context(
     content: &str,
     position: Position,
 ) -> Option<String> {
-    let root = tree.root_node();
-    let byte_offset = position_to_byte_offset(content, position);
-
-    // Find the node at the cursor position
-    let node = root.descendant_for_byte_range(byte_offset, byte_offset)?;
-
     // Walk up to find the innermost struct node with a name
-    let mut current = node;
+    let mut current = node_at_position(tree, content, position)?;
     loop {
         if current.kind() == "struct" {
             // Check if this struct has a name (making it a variant)
@@ -117,15 +99,9 @@ pub fn get_containing_field_context(
     content: &str,
     position: Position,
 ) -> Option<String> {
-    let root = tree.root_node();
-    let byte_offset = position_to_byte_offset(content, position);
-
-    // Find the node at the cursor position
-    let node = root.descendant_for_byte_range(byte_offset, byte_offset)?;
-
-    // Walk up the tree to find field nodes
-    // We want to find the parent field that contains a struct which contains our current field
-    let mut current = node;
+    // Walk up the tree to find the parent field that contains a struct which
+    // contains our current field
+    let mut current = node_at_position(tree, content, position)?;
     let mut found_current_field = false;
 
     loop {
