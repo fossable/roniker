@@ -112,15 +112,20 @@ pub fn node_at_position<'a>(tree: &'a Tree, content: &str, position: Position) -
     root.descendant_for_byte_range(byte_offset, byte_offset)
 }
 
+/// Iterate over `node` and each of its ancestors, innermost first (the node
+/// itself comes first, then its parent, and so on up to the root).
+pub fn ancestors<'a>(node: Node<'a>) -> impl Iterator<Item = Node<'a>> {
+    let mut next = Some(node);
+    std::iter::from_fn(move || {
+        let current = next?;
+        next = current.parent();
+        Some(current)
+    })
+}
+
 /// Find the first ancestor of a node with a given kind
-pub fn find_ancestor_by_kind<'a>(mut node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    while let Some(parent) = node.parent() {
-        if parent.kind() == kind {
-            return Some(parent);
-        }
-        node = parent;
-    }
-    None
+pub fn find_ancestor_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    ancestors(node).skip(1).find(|n| n.kind() == kind)
 }
 
 /// Collect all descendant nodes of a given kind, depth-first

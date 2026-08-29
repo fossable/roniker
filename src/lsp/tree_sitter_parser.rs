@@ -1,4 +1,4 @@
-use super::ts_utils::{child_by_kind, field_name, node_at_position, struct_name};
+use super::ts_utils::{ancestors, child_by_kind, field_name, node_at_position, struct_name};
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Tree};
 
@@ -17,20 +17,15 @@ pub fn find_type_context_at_position(
     position: Position,
 ) -> Vec<TypeContext> {
     let mut contexts = Vec::new();
-    if let Some(mut current) = node_at_position(tree, content, position) {
+    if let Some(current) = node_at_position(tree, content, position) {
         // Walk up the tree to collect all struct contexts
-        loop {
-            if current.kind() == "struct"
-                && let Some(type_name) = struct_name(&current, content)
+        for node in ancestors(current) {
+            if node.kind() == "struct"
+                && let Some(type_name) = struct_name(&node, content)
             {
                 contexts.push(TypeContext {
                     type_name: type_name.to_string(),
                 });
-            }
-
-            match current.parent() {
-                Some(parent) => current = parent,
-                None => break,
             }
         }
     }
@@ -43,19 +38,8 @@ pub fn find_type_context_at_position(
 /// Get the field name at a specific position in RON content using tree-sitter
 pub fn get_field_at_position(tree: &Tree, content: &str, position: Position) -> Option<String> {
     // Walk up to find a field node
-    let mut current = node_at_position(tree, content, position)?;
-    loop {
-        if let Some(name) = field_name(&current, content) {
-            return Some(name.to_string());
-        }
-
-        match current.parent() {
-            Some(parent) => current = parent,
-            None => break,
-        }
-    }
-
-    None
+    let current = node_at_position(tree, content, position)?;
+    ancestors(current).find_map(|node| field_name(&node, content).map(str::to_string))
 }
 
 /// Find the current variant context (enum variant name) at a position
@@ -65,25 +49,18 @@ pub fn find_current_variant_context(
     position: Position,
 ) -> Option<String> {
     // Walk up to find the innermost struct node with a name
-    let mut current = node_at_position(tree, content, position)?;
-    loop {
-        if current.kind() == "struct" {
-            // Check if this struct has a name (making it a variant)
-            if let Some(name) = struct_name(&current, content) {
-                // Make sure it's actually a variant by checking if it's uppercase
-                if name.chars().next()?.is_uppercase() {
-                    return Some(name.to_string());
-                }
-            }
+    let current = node_at_position(tree, content, position)?;
+    ancestors(current).find_map(|node| {
+        if node.kind() != "struct" {
+            return None;
         }
-
-        match current.parent() {
-            Some(parent) => current = parent,
-            None => break,
-        }
-    }
-
-    None
+        // A struct is a variant when it has a name that starts uppercase.
+        let name = struct_name(&node, content)?;
+        name.chars()
+            .next()
+            .filter(|c| c.is_uppercase())
+            .map(|_| name.to_string())
+    })
 }
 
 /// Get the containing field context by finding the parent field
@@ -94,30 +71,13 @@ pub fn get_containing_field_context(
     position: Position,
 ) -> Option<String> {
     // Walk up the tree to find the parent field that contains a struct which
-    // contains our current field
-    let mut current = node_at_position(tree, content, position)?;
-    let mut found_current_field = false;
-
-    loop {
-        if current.kind() == "field" {
-            if found_current_field {
-                // This is the containing field - extract its name
-                if let Some(name) = field_name(&current, content) {
-                    return Some(name.to_string());
-                }
-            } else {
-                // This is the first field we found (the one we're in)
-                found_current_field = true;
-            }
-        }
-
-        match current.parent() {
-            Some(parent) => current = parent,
-            None => break,
-        }
-    }
-
-    None
+    // contains our current field. The first field ancestor is the one we're in;
+    // the next named field ancestor is the containing field.
+    let current = node_at_position(tree, content, position)?;
+    ancestors(current)
+        .filter(|node| node.kind() == "field")
+        .skip(1)
+        .find_map(|node| field_name(&node, content).map(str::to_string))
 }
 
 /// Information about a variant field location in RON content
@@ -175,14 +135,9 @@ fn visit_fields(node: &Node, content: &str, locations: &mut Vec<VariantFieldLoca
 
 /// Find the parent field name of a node
 fn find_parent_field_name(node: &Node, content: &str) -> Option<String> {
-    let mut current = *node;
-    while let Some(parent) = current.parent() {
-        if let Some(name) = field_name(&parent, content) {
-            return Some(name.to_string());
-        }
-        current = parent;
-    }
-    None
+    ancestors(*node)
+        .skip(1)
+        .find_map(|n| field_name(&n, content).map(str::to_string))
 }
 
 /// Collect all fields in a node
