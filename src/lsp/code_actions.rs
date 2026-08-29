@@ -108,25 +108,16 @@ pub fn generate_remove_field_actions(
             )
         };
 
-        let mut changes = std::collections::HashMap::new();
-        changes.insert(
-            url.clone(),
+        actions.push(single_file_action(
+            url,
+            format!("Remove field '{}'", name),
+            CodeActionKind::QUICKFIX,
             vec![TextEdit {
                 range,
                 new_text: String::new(),
             }],
-        );
-
-        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-            title: format!("Remove field '{}'", name),
-            kind: Some(CodeActionKind::QUICKFIX),
-            diagnostics: Some(vec![diag.clone()]),
-            edit: Some(WorkspaceEdit {
-                changes: Some(changes),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }));
+            Some(vec![diag.clone()]),
+        ));
     }
 
     actions
@@ -203,24 +194,19 @@ fn generate_missing_variant_field_actions(
         if !required_missing.is_empty()
             && let Some(edit) = generate_field_insertions(tree, &required_missing)
         {
-            let mut changes = std::collections::HashMap::new();
-            changes.insert(url.clone(), vec![edit]);
-
-            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                title: format!(
+            actions.push(single_file_action(
+                url,
+                format!(
                     "Add {} required field{} to {}::{}",
                     required_missing.len(),
-                    if required_missing.len() == 1 { "" } else { "s" },
+                    plural(required_missing.len()),
                     location.containing_field_name,
                     location.variant_name
                 ),
-                kind: Some(CodeActionKind::QUICKFIX),
-                edit: Some(WorkspaceEdit {
-                    changes: Some(changes),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }));
+                CodeActionKind::QUICKFIX,
+                vec![edit],
+                None,
+            ));
         }
     }
 
@@ -295,46 +281,36 @@ fn generate_missing_field_actions(
             if !required_missing.is_empty()
                 && let Some(edit) = generate_field_insertions(tree, &required_missing)
             {
-                let mut changes = std::collections::HashMap::new();
-                changes.insert(url.clone(), vec![edit]);
-
-                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                    title: format!(
+                actions.push(single_file_action(
+                    url,
+                    format!(
                         "Add {} required field{} to {}",
                         required_missing.len(),
-                        if required_missing.len() == 1 { "" } else { "s" },
+                        plural(required_missing.len()),
                         variant_name
                     ),
-                    kind: Some(CodeActionKind::QUICKFIX),
-                    edit: Some(WorkspaceEdit {
-                        changes: Some(changes),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }));
+                    CodeActionKind::QUICKFIX,
+                    vec![edit],
+                    None,
+                ));
             }
 
             // Code action: Add all fields for variant
             if !all_missing.is_empty()
                 && let Some(edit) = generate_field_insertions(tree, &all_missing)
             {
-                let mut changes = std::collections::HashMap::new();
-                changes.insert(url.clone(), vec![edit]);
-
-                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                    title: format!(
+                actions.push(single_file_action(
+                    url,
+                    format!(
                         "Add all {} missing field{} to {}",
                         all_missing.len(),
-                        if all_missing.len() == 1 { "" } else { "s" },
+                        plural(all_missing.len()),
                         variant_name
                     ),
-                    kind: Some(CodeActionKind::QUICKFIX),
-                    edit: Some(WorkspaceEdit {
-                        changes: Some(changes),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }));
+                    CodeActionKind::QUICKFIX,
+                    vec![edit],
+                    None,
+                ));
             }
 
             return actions;
@@ -365,44 +341,34 @@ fn generate_missing_field_actions(
     if !required_missing.is_empty()
         && let Some(edit) = generate_field_insertions(tree, &required_missing)
     {
-        let mut changes = std::collections::HashMap::new();
-        changes.insert(url.clone(), vec![edit]);
-
-        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-            title: format!(
+        actions.push(single_file_action(
+            url,
+            format!(
                 "Add {} required field{}",
                 required_missing.len(),
-                if required_missing.len() == 1 { "" } else { "s" }
+                plural(required_missing.len())
             ),
-            kind: Some(CodeActionKind::QUICKFIX),
-            edit: Some(WorkspaceEdit {
-                changes: Some(changes),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }));
+            CodeActionKind::QUICKFIX,
+            vec![edit],
+            None,
+        ));
     }
 
     // Code action: Add all fields
     if !all_missing.is_empty()
         && let Some(edit) = generate_field_insertions(tree, &all_missing)
     {
-        let mut changes = std::collections::HashMap::new();
-        changes.insert(url.clone(), vec![edit]);
-
-        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-            title: format!(
+        actions.push(single_file_action(
+            url,
+            format!(
                 "Add all {} missing field{}",
                 all_missing.len(),
-                if all_missing.len() == 1 { "" } else { "s" }
+                plural(all_missing.len())
             ),
-            kind: Some(CodeActionKind::QUICKFIX),
-            edit: Some(WorkspaceEdit {
-                changes: Some(changes),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }));
+            CodeActionKind::QUICKFIX,
+            vec![edit],
+            None,
+        ));
     }
 
     actions
@@ -424,9 +390,10 @@ fn create_explicit_root_type_action(
         let type_name = super::type_utils::short_name(&type_info.name);
         let pos = main_value.start_position();
 
-        let mut changes = std::collections::HashMap::new();
-        changes.insert(
-            url.clone(),
+        return Some(single_file_action(
+            url,
+            format!("Make struct name explicit: {}", type_name),
+            CodeActionKind::REFACTOR,
             vec![TextEdit {
                 range: Range::new(
                     Position::new(pos.row as u32, pos.column as u32),
@@ -434,17 +401,8 @@ fn create_explicit_root_type_action(
                 ),
                 new_text: type_name.to_string(),
             }],
-        );
-
-        return Some(CodeActionOrCommand::CodeAction(CodeAction {
-            title: format!("Make struct name explicit: {}", type_name),
-            kind: Some(CodeActionKind::REFACTOR),
-            edit: Some(WorkspaceEdit {
-                changes: Some(changes),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }));
+            None,
+        ));
     }
 
     None
@@ -479,9 +437,10 @@ fn create_explicit_field_type_action(
                     .unwrap_or(&type_name);
 
                 let pos = value_node.start_position();
-                let mut changes = std::collections::HashMap::new();
-                changes.insert(
-                    url.clone(),
+                return Some(single_file_action(
+                    url,
+                    format!("Make field type explicit: {} {}", field.name, clean_type),
+                    CodeActionKind::REFACTOR,
                     vec![TextEdit {
                         range: Range::new(
                             Position::new(pos.row as u32, pos.column as u32),
@@ -489,17 +448,8 @@ fn create_explicit_field_type_action(
                         ),
                         new_text: clean_type.to_string(),
                     }],
-                );
-
-                return Some(CodeActionOrCommand::CodeAction(CodeAction {
-                    title: format!("Make field type explicit: {} {}", field.name, clean_type),
-                    kind: Some(CodeActionKind::REFACTOR),
-                    edit: Some(WorkspaceEdit {
-                        changes: Some(changes),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }));
+                    None,
+                ));
             }
         }
     }
@@ -648,12 +598,46 @@ fn is_numeric_type(clean: &str) -> bool {
     )
 }
 
+/// Plural suffix for a count: `""` for exactly one, `"s"` otherwise.
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+/// Build a `CodeAction` that applies `edits` to a single document (`url`).
+///
+/// Every code action in this module targets one file, so they all wrap their
+/// edits in the same single-entry `changes` map and `WorkspaceEdit`; this
+/// centralizes that boilerplate.
+fn single_file_action(
+    url: &Url,
+    title: String,
+    kind: CodeActionKind,
+    edits: Vec<TextEdit>,
+    diagnostics: Option<Vec<Diagnostic>>,
+) -> CodeActionOrCommand {
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(url.clone(), edits);
+
+    CodeActionOrCommand::CodeAction(CodeAction {
+        title,
+        kind: Some(kind),
+        diagnostics,
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn parse(content: &str) -> Tree {
-        super::super::ts_utils::RonParser::new().parse(content).unwrap()
+        super::super::ts_utils::RonParser::new()
+            .parse(content)
+            .unwrap()
     }
     use crate::rust_analyzer::TypeKind;
 
@@ -752,7 +736,8 @@ mod tests {
         };
         let url = Url::parse("file:///test.ron").unwrap();
 
-        let action = create_explicit_field_type_action(&parse(content), content, &field, None, &url);
+        let action =
+            create_explicit_field_type_action(&parse(content), content, &field, None, &url);
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -788,7 +773,8 @@ mod tests {
         };
         let url = Url::parse("file:///test.ron").unwrap();
 
-        let action = create_explicit_field_type_action(&parse(content), content, &field, None, &url);
+        let action =
+            create_explicit_field_type_action(&parse(content), content, &field, None, &url);
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -818,7 +804,8 @@ mod tests {
         };
         let url = Url::parse("file:///test.ron").unwrap();
 
-        let action = create_explicit_field_type_action(&parse(content), content, &field, None, &url);
+        let action =
+            create_explicit_field_type_action(&parse(content), content, &field, None, &url);
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -865,7 +852,8 @@ mod tests {
         let url = Url::parse("file:///test.ron").unwrap();
 
         // Should not offer action since field type is already explicit
-        let action = create_explicit_field_type_action(&parse(content), content, &field, None, &url);
+        let action =
+            create_explicit_field_type_action(&parse(content), content, &field, None, &url);
         assert!(action.is_none());
     }
 
@@ -903,7 +891,8 @@ mod tests {
         };
         let url = Url::parse("file:///test.ron").unwrap();
 
-        let action = create_explicit_field_type_action(&parse(content), content, &field, None, &url);
+        let action =
+            create_explicit_field_type_action(&parse(content), content, &field, None, &url);
         assert!(action.is_some());
 
         if let Some(CodeActionOrCommand::CodeAction(action)) = action {
@@ -977,7 +966,8 @@ mod tests {
 
         let analyzer = Arc::new(RustAnalyzer::new());
 
-        let actions = generate_code_actions(&parse(content), content, &type_info, &url, analyzer, &[]);
+        let actions =
+            generate_code_actions(&parse(content), content, &type_info, &url, analyzer, &[]);
 
         // Should suggest adding missing field_b
         assert!(!actions.is_empty());
@@ -1026,8 +1016,7 @@ mod tests {
             ..Default::default()
         };
 
-        let actions =
-            generate_remove_field_actions(&parse(content), content, &[diagnostic], &url);
+        let actions = generate_remove_field_actions(&parse(content), content, &[diagnostic], &url);
         assert_eq!(actions.len(), 1);
         let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
             panic!("expected code action");
@@ -1053,8 +1042,7 @@ mod tests {
             ..Default::default()
         };
 
-        let actions =
-            generate_remove_field_actions(&parse(content), content, &[diagnostic], &url);
+        let actions = generate_remove_field_actions(&parse(content), content, &[diagnostic], &url);
         assert!(actions.is_empty());
     }
 }
