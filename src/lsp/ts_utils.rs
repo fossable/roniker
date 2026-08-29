@@ -153,7 +153,6 @@ pub fn children_by_kind<'a>(node: &Node<'a>, kind: &str) -> Vec<Node<'a>> {
 }
 
 /// Get the first child of a node with a specific kind
-#[cfg(test)]
 pub fn child_by_kind<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
     let mut cursor = node.walk();
 

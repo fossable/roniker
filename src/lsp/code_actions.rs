@@ -529,14 +529,7 @@ fn generate_field_insertions(
     // For ERROR nodes, the struct is likely a SIBLING, not a child
     let struct_node = if main_value.kind() == "ERROR" {
         // Look for struct node among root's children
-        let mut cursor = root.walk();
-        let result = root.children(&mut cursor).find(|n| n.kind() == "struct");
-        match result {
-            Some(s) => s,
-            None => {
-                return None;
-            }
-        }
+        ts_utils::child_by_kind(&root, "struct")?
     } else {
         main_value
     };

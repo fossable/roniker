@@ -1201,10 +1201,7 @@ fn extract_field_value_text(tree: Option<&Tree>, content: &str, field_name: &str
     if main_value.kind() == "struct" || main_value.kind() == "ERROR" {
         // For ERROR nodes, find the struct sibling
         let struct_node = if main_value.kind() == "ERROR" {
-            let root = tree.root_node();
-            let mut cursor = root.walk();
-            let result = root.children(&mut cursor).find(|n| n.kind() == "struct");
-            result?
+            ts_utils::child_by_kind(&tree.root_node(), "struct")?
         } else {
             main_value
         };
