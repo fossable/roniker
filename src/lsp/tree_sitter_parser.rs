@@ -1,4 +1,4 @@
-use super::ts_utils::{field_name, node_at_position, struct_name};
+use super::ts_utils::{child_by_kind, field_name, node_at_position, struct_name};
 use tower_lsp::lsp_types::Position;
 use tree_sitter::{Node, Tree};
 
@@ -228,13 +228,9 @@ pub fn extract_fields_from_ron(tree: &Tree, content: &str) -> Vec<String> {
     let root = tree.root_node();
 
     // Find the first struct node (the top-level value)
-    let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        if child.kind() == "struct" {
-            // Collect only direct child fields of this struct
-            collect_direct_field_names(&child, content, &mut fields);
-            break;
-        }
+    if let Some(struct_node) = child_by_kind(&root, "struct") {
+        // Collect only direct child fields of this struct
+        collect_direct_field_names(&struct_node, content, &mut fields);
     }
 
     fields.into_iter().collect()
