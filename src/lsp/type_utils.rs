@@ -39,20 +39,37 @@ pub fn is_primitive_type(type_name: &str) -> bool {
     primitives.contains(&clean.as_str())
 }
 
+/// Standard-library generic wrappers the analyzer never resolves as a
+/// user-defined type. Each entry includes the opening `<` so a name only counts
+/// when it is actually used as a generic (e.g. `Option<T>`, not a struct named
+/// `Options`).
+const STD_GENERIC_WRAPPERS: [&str; 10] = [
+    "Option<",
+    "Vec<",
+    "HashMap<",
+    "BTreeMap<",
+    "HashSet<",
+    "BTreeSet<",
+    "Result<",
+    "Box<",
+    "Rc<",
+    "Arc<",
+];
+
 /// Check if a type is a standard library generic type (Option, Vec, HashMap, etc.)
+///
+/// A wrapper counts anywhere it appears, not only at the start, so composite
+/// types that merely embed one — e.g. the tuple `(u8, Vec<Config>)` — are
+/// treated the same regardless of which wrapper they contain. Previously only
+/// the map/set wrappers were matched this way, so a tuple embedding a `Vec` or
+/// `Box` was misclassified as a custom type and drew a spurious "Unknown type"
+/// diagnostic while the same tuple embedding a `HashMap` did not.
 pub fn is_std_generic_type(type_name: &str) -> bool {
     let clean = type_name.replace(" ", "");
 
-    clean.starts_with("Option<")
-        || clean.starts_with("Vec<")
-        || clean.contains("HashMap<")
-        || clean.contains("BTreeMap<")
-        || clean.contains("HashSet<")
-        || clean.contains("BTreeSet<")
-        || clean.starts_with("Result<")
-        || clean.starts_with("Box<")
-        || clean.starts_with("Rc<")
-        || clean.starts_with("Arc<")
+    STD_GENERIC_WRAPPERS
+        .iter()
+        .any(|wrapper| clean.contains(wrapper))
 }
 
 /// Check if a type is a user-defined struct or enum — i.e. something the
@@ -154,6 +171,35 @@ mod tests {
         assert_eq!(strip_outer_generic("Post"), "Post");
         // Only the outermost layer is stripped.
         assert_eq!(strip_outer_generic("Option<Vec<Post>>"), "Vec<Post>");
+    }
+
+    #[test]
+    fn test_is_std_generic_type() {
+        // Plain wrappers, including whitespace variants.
+        assert!(is_std_generic_type("Option<Post>"));
+        assert!(is_std_generic_type("Vec < Post >"));
+        assert!(is_std_generic_type("HashMap<String, u32>"));
+        assert!(is_std_generic_type("Box<Config>"));
+
+        // Embedded in a composite type is matched consistently for every
+        // wrapper, not just the map/set family.
+        assert!(is_std_generic_type("(u8, Vec<Config>)"));
+        assert!(is_std_generic_type("(u8, Box<Config>)"));
+        assert!(is_std_generic_type("(u8, HashMap<String, u32>)"));
+
+        // A struct/enum named similarly to a wrapper is not a std generic: the
+        // trailing `<` is required.
+        assert!(!is_std_generic_type("Options"));
+        assert!(!is_std_generic_type("Post"));
+    }
+
+    #[test]
+    fn test_is_custom_type() {
+        assert!(is_custom_type("Post"));
+        assert!(!is_custom_type("bool"));
+        assert!(!is_custom_type("Vec<Post>"));
+        // A tuple embedding a std wrapper is not a resolvable custom type.
+        assert!(!is_custom_type("(u8, Vec<Config>)"));
     }
 
     #[test]
