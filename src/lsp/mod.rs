@@ -447,11 +447,7 @@ impl LanguageServer for Backend {
                         if let Some(variant) = field_type_info.find_variant(&word) {
                             let mut hover_text = format!(
                                 "```rust\nenum {}\n```\n\n**Variant:** `{}`",
-                                field_type_info
-                                    .name
-                                    .split("::")
-                                    .last()
-                                    .unwrap_or(&field_type_info.name),
+                                type_utils::short_name(&field_type_info.name),
                                 variant.name
                             );
 
