@@ -55,8 +55,11 @@ fn get_completion_context(tree: &Tree, content: &str, position: Position) -> Com
     CompletionContext::FieldName
 }
 
-/// Generate completions for a given type (already navigated to the innermost type)
-/// Type context navigation is now done in main.rs using Backend::navigate_to_innermost_type
+/// Generate completions for a given type (already navigated to the innermost type).
+/// Type context navigation happens before this call in [`navigation::navigate_type_contexts`],
+/// invoked from `lsp/mod.rs`.
+///
+/// [`navigation::navigate_type_contexts`]: super::navigation::navigate_type_contexts
 pub fn generate_completions_for_type(
     tree: &Tree,
     content: &str,
@@ -64,22 +67,17 @@ pub fn generate_completions_for_type(
     type_info: &TypeInfo,
     analyzer: Arc<RustAnalyzer>,
 ) -> Vec<CompletionItem> {
-    let effective_type = type_info;
-
     let context = get_completion_context(tree, content, position);
 
     match context {
         CompletionContext::FieldName => {
-            generate_field_completions(tree, content, position, effective_type, &analyzer)
+            generate_field_completions(tree, content, position, type_info, &analyzer)
         }
         CompletionContext::FieldValue => {
             // Find the field we're completing the value for
             if let Some(field_name) = find_current_field(tree, content, position) {
-                let mut completions = generate_value_completions_for_field(
-                    field_name,
-                    effective_type,
-                    analyzer.clone(),
-                );
+                let mut completions =
+                    generate_value_completions_for_field(field_name, type_info, analyzer.clone());
 
                 // Also add all workspace symbols as potential completions
                 completions.extend(get_all_workspace_types(analyzer));
@@ -92,7 +90,7 @@ pub fn generate_completions_for_type(
         CompletionContext::StructType => {
             // Find the field type and provide struct completions
             if let Some(field_name) = find_current_field(tree, content, position) {
-                generate_type_completions_for_field(field_name, effective_type, analyzer)
+                generate_type_completions_for_field(field_name, type_info, analyzer)
             } else {
                 Vec::new()
             }
