@@ -107,6 +107,14 @@ fn get_all_workspace_types(analyzer: Arc<RustAnalyzer>) -> Vec<CompletionItem> {
         .collect()
 }
 
+/// Wrap Markdown text as LSP completion documentation.
+fn markdown_docs(value: String) -> Documentation {
+    Documentation::MarkupContent(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value,
+    })
+}
+
 /// Build a completion item for a struct/variant field, labeled with the name
 /// serde expects in the RON file.
 fn field_completion(name: &str, field: &FieldInfo) -> CompletionItem {
@@ -120,10 +128,7 @@ fn field_completion(name: &str, field: &FieldInfo) -> CompletionItem {
         label: name.to_string(),
         kind: Some(CompletionItemKind::FIELD),
         detail: Some(field.type_name.clone()),
-        documentation: Some(Documentation::MarkupContent(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value,
-        })),
+        documentation: Some(markdown_docs(value)),
         insert_text: Some(format!("{}: ", name)),
         ..Default::default()
     }
@@ -175,17 +180,11 @@ fn generate_field_completions(
                 .iter()
                 .map(|variant| {
                     let name = variant.serialized_name(rename_all);
-                    let documentation = if let Some(docs) = &variant.docs {
-                        Some(Documentation::MarkupContent(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: format!("```rust\n{}\n```\n\n{}", name, docs),
-                        }))
-                    } else {
-                        Some(Documentation::MarkupContent(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: format!("```rust\n{}\n```", name),
-                        }))
+                    let value = match &variant.docs {
+                        Some(docs) => format!("```rust\n{}\n```\n\n{}", name, docs),
+                        None => format!("```rust\n{}\n```", name),
                     };
+                    let documentation = Some(markdown_docs(value));
 
                     let insert_text = if variant.fields.is_empty() {
                         name.clone()
@@ -271,12 +270,7 @@ fn create_type_completion(type_info: &TypeInfo) -> CompletionItem {
                 label: type_name.to_string(),
                 kind: Some(CompletionItemKind::STRUCT),
                 detail: Some(format!("struct {}", type_info.name)),
-                documentation: type_info.docs.as_ref().map(|docs| {
-                    Documentation::MarkupContent(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: docs.clone(),
-                    })
-                }),
+                documentation: type_info.docs.as_ref().map(|docs| markdown_docs(docs.clone())),
                 insert_text: Some(snippet),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 ..Default::default()
@@ -288,12 +282,7 @@ fn create_type_completion(type_info: &TypeInfo) -> CompletionItem {
                 label: type_name.to_string(),
                 kind: Some(CompletionItemKind::ENUM),
                 detail: Some(format!("enum {}", type_info.name)),
-                documentation: type_info.docs.as_ref().map(|docs| {
-                    Documentation::MarkupContent(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: docs.clone(),
-                    })
-                }),
+                documentation: type_info.docs.as_ref().map(|docs| markdown_docs(docs.clone())),
                 insert_text: Some(format!("{}($0)", type_name)),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 ..Default::default()
@@ -324,12 +313,7 @@ fn generate_value_completions_by_type(
                         label: name.clone(),
                         kind: Some(CompletionItemKind::ENUM_MEMBER),
                         detail: Some(format!("Variant of {}", type_info.name)),
-                        documentation: variant.docs.as_ref().map(|docs| {
-                            Documentation::MarkupContent(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: docs.clone(),
-                            })
-                        }),
+                        documentation: variant.docs.as_ref().map(|docs| markdown_docs(docs.clone())),
                         insert_text: Some(name),
                         ..Default::default()
                     };
