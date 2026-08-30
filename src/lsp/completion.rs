@@ -1,5 +1,5 @@
 use super::tree_sitter_parser;
-use super::type_utils::{extract_inner_type, short_name, strip_outer_generic};
+use super::type_utils::{extract_inner_type, normalize_type, short_name, strip_outer_generic};
 use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
@@ -310,7 +310,7 @@ fn generate_value_completions_by_type(
     let mut completions = Vec::new();
 
     // Clean up the type string (remove spaces)
-    let clean_type = field_type.replace(" ", "");
+    let clean_type = normalize_type(field_type);
 
     // First check if this is a custom type (struct or enum) in the workspace
     if let Some(type_info) = analyzer.get_type_info(field_type) {
