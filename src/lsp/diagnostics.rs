@@ -344,8 +344,8 @@ async fn validate_struct_fields(
     // Single tree-sitter parse: drives unknown-field detection, field value node access
     // (for custom-type validation via validate_field_value_node), position reporting,
     // and missing-field detection — no re-parsing or string extraction required.
-    // Tuple/newtype structs have numeric field names ("0", "1", ...) — skip named-field validation
-    if fields.iter().all(|f| f.name.parse::<usize>().is_ok()) {
+    // Tuple/newtype structs have positional fields ("0", "1", ...) — skip named-field validation
+    if fields.iter().all(FieldInfo::is_positional) {
         return diagnostics;
     }
 
@@ -707,8 +707,8 @@ async fn validate_node_with_type_info<'a>(
 
     match &type_info.kind {
         TypeKind::Struct(fields) => {
-            // Tuple/newtype structs have numeric field names — skip named-field validation
-            if fields.iter().all(|f| f.name.parse::<usize>().is_ok()) {
+            // Tuple/newtype structs have positional fields — skip named-field validation
+            if fields.iter().all(FieldInfo::is_positional) {
                 return diagnostics;
             }
 
@@ -863,9 +863,7 @@ async fn validate_variant_field_data(
     // Try to parse the data as RON
     // For struct variants, the data contains named fields like "field1: val, field2: val"
     // For tuple variants, the data contains unnamed values like "val1, val2"
-    let has_named_fields = expected_fields
-        .iter()
-        .any(|f| f.name.parse::<usize>().is_err());
+    let has_named_fields = expected_fields.iter().any(|f| !f.is_positional());
 
     let parsed_data = if has_named_fields {
         // Struct-like variant: wrap the named fields in parentheses for RON parsing
@@ -882,10 +880,7 @@ async fn validate_variant_field_data(
     match parsed_data {
         Ok(value) => {
             // Validate fields based on whether it's named or unnamed
-            if expected_fields
-                .iter()
-                .all(|f| f.name.parse::<usize>().is_err())
-            {
+            if expected_fields.iter().all(|f| !f.is_positional()) {
                 // Named fields (struct-like variant)
                 if let Some(map) = extract_map_from_value(&value) {
                     // First, check for unknown fields - extract from the parsed value, not raw data

@@ -40,6 +40,14 @@ impl FieldInfo {
         self.type_name.replace(' ', "").starts_with("Option<")
     }
 
+    /// Whether this field is positional rather than named — i.e. a field of a
+    /// tuple or newtype struct/variant, whose name is its index (`"0"`, `"1"`,
+    /// ...) instead of a real identifier. Named-field validation does not apply
+    /// to these.
+    pub fn is_positional(&self) -> bool {
+        self.name.parse::<usize>().is_ok()
+    }
+
     /// The name serde expects for this field, honoring `#[serde(rename)]`
     /// and the container's `#[serde(rename_all)]` convention.
     pub fn serialized_name(&self, container_rename_all: Option<&str>) -> String {
