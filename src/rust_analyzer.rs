@@ -856,7 +856,7 @@ fn has_default_derive(attrs: &[syn::Attribute]) -> bool {
 #[cfg(feature = "analyze")]
 fn type_to_string(ty: &syn::Type) -> String {
     match ty {
-        syn::Type::Path(type_path) => quote::quote!(#type_path).to_string(),
+        syn::Type::Path(type_path) => normalize_type_tokens(&quote::quote!(#type_path).to_string()),
         syn::Type::Reference(type_ref) => {
             let inner = type_to_string(&type_ref.elem);
             if type_ref.mutability.is_some() {
@@ -865,8 +865,34 @@ fn type_to_string(ty: &syn::Type) -> String {
                 format!("&{}", inner)
             }
         }
-        _ => quote::quote!(#ty).to_string(),
+        _ => normalize_type_tokens(&quote::quote!(#ty).to_string()),
     }
+}
+
+/// Render a `quote!`-tokenized type string as an idiomatic Rust type name.
+///
+/// `quote!(#ty).to_string()` puts a space between every token, so a field of
+/// type `Vec<String>` comes out as `"Vec < String >"`. Those names are shown
+/// to users verbatim in completions, hover, and inline type hints, so collapse
+/// the spurious punctuation spacing back to the conventional form
+/// (`Vec<String>`, `HashMap<String, u32>`, `crate::foo::Bar`).
+fn normalize_type_tokens(s: &str) -> String {
+    let mut out = s.to_string();
+    for (from, to) in [
+        (" :: ", "::"),
+        (" < ", "<"),
+        (" > ", ">"),
+        (" >", ">"),
+        ("< ", "<"),
+        (" , ", ", "),
+        (" ,", ","),
+        (" ; ", "; "),
+        (" ;", ";"),
+        ("& ", "&"),
+    ] {
+        out = out.replace(from, to);
+    }
+    out
 }
 
 #[cfg(feature = "analyze")]
@@ -949,6 +975,29 @@ mod serde_attributes {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_type_to_string_is_idiomatic() {
+        let cases = [
+            ("Vec<String>", "Vec<String>"),
+            ("Option<u64>", "Option<u64>"),
+            ("HashMap<String, u32>", "HashMap<String, u32>"),
+            (
+                "std::collections::HashMap<String, Vec<u8>>",
+                "std::collections::HashMap<String, Vec<u8>>",
+            ),
+            ("(u8, u16)", "(u8, u16)"),
+            ("[u8; 4]", "[u8; 4]"),
+            ("&str", "&str"),
+            ("&mut Foo", "&mut Foo"),
+            ("Box<dyn Trait>", "Box<dyn Trait>"),
+            ("crate::config::AppConfig", "crate::config::AppConfig"),
+        ];
+        for (input, expected) in cases {
+            let ty: syn::Type = syn::parse_str(input).unwrap();
+            assert_eq!(type_to_string(&ty), expected, "for input {input}");
+        }
+    }
 
     #[test]
     fn test_rust_analyzer_serialization_roundtrip() {
