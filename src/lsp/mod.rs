@@ -831,53 +831,42 @@ fn char_col_to_byte(line: &str, col: usize) -> usize {
 }
 
 fn get_word_at_position(content: &str, position: Position) -> Option<String> {
-    let lines: Vec<&str> = content.lines().collect();
+    let line = content.lines().nth(position.line as usize)?;
 
-    if position.line as usize >= lines.len() {
-        return None;
-    }
-
-    let line = lines[position.line as usize];
+    // The LSP character offset is a column, not a byte index. Work over the
+    // line's chars so a multibyte character (in a string value or comment) can
+    // never make us slice mid-codepoint and panic.
+    let chars: Vec<char> = line.chars().collect();
     let col = position.character as usize;
-
-    if col > line.len() {
+    if col > chars.len() {
         return None;
     }
 
-    // Check if we're currently on a non-word character
-    // If so, look backward to find a word
-    let actual_col = if col > 0 && col <= line.len() {
-        let ch = line.chars().nth(col.saturating_sub(1));
-        if matches!(ch, Some(c) if !c.is_alphanumeric() && c != '_') {
-            // We're on punctuation, look backward for a word
-            col.saturating_sub(1)
-        } else {
-            col
-        }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+
+    // If the cursor sits just after a non-word character, step back one so a
+    // word ending at the cursor is still found.
+    let actual_col = if col > 0 && !is_word(chars[col - 1]) {
+        col - 1
     } else {
         col
     };
 
-    // Find word boundaries around actual_col
-    let start = line[..actual_col]
-        .rfind(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    // Find word boundaries around actual_col.
+    let start = chars[..actual_col]
+        .iter()
+        .rposition(|&c| !is_word(c))
+        .map_or(0, |i| i + 1);
 
-    let end = line[actual_col..]
-        .find(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|i| actual_col + i)
-        .unwrap_or(line.len());
+    let end = chars[actual_col..]
+        .iter()
+        .position(|&c| !is_word(c))
+        .map_or(chars.len(), |i| actual_col + i);
 
     if start < end {
-        let word = line[start..end].to_string();
-        // Only return if it's a valid identifier (starts with letter or underscore, not a number)
-        if word
-            .chars()
-            .next()
-            .map(|c| c.is_alphabetic() || c == '_')
-            .unwrap_or(false)
-        {
+        let word: String = chars[start..end].iter().collect();
+        // Only return identifiers (starts with a letter or underscore, not a number).
+        if is_valid_identifier(&word) {
             return Some(word);
         }
     }
@@ -1747,6 +1736,22 @@ User(
 
         let word = get_word_at_position(content, position);
         assert_eq!(word, Some("length".to_string()));
+    }
+
+    #[test]
+    fn test_get_word_at_position_with_multibyte_line() {
+        // A multibyte character before the cursor must not cause a mid-codepoint
+        // slice. Columns are char offsets: c(0) a(1) f(2) é(3) :(4) ' '(5) x(6).
+        // `é` is two UTF-8 bytes, so a cursor just past it (col 4) used to index
+        // the byte string at a non-char boundary and panic.
+        let content = "café: x";
+        let word = get_word_at_position(content, Position::new(0, 4));
+        assert_eq!(word, Some("café".to_string()));
+
+        // Cursor just after the trailing identifier resolves to it, unaffected
+        // by the multibyte char earlier on the line.
+        let word = get_word_at_position(content, Position::new(0, 7));
+        assert_eq!(word, Some("x".to_string()));
     }
 
     #[test]
