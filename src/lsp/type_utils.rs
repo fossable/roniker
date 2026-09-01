@@ -7,6 +7,14 @@ pub fn short_name(path: &str) -> &str {
     path.rsplit("::").next().unwrap_or(path)
 }
 
+/// Normalize a type name for comparison by removing all spaces, so that
+/// `Vec < Post >` and `Vec<Post>` are treated the same. Depending on the source
+/// formatting the analyzer extracts types with inconsistent internal spacing,
+/// so this is applied before any prefix/suffix or set-membership checks.
+pub fn normalize_type(type_name: &str) -> String {
+    type_name.replace(' ', "")
+}
+
 /// Extract the inner type from a generic type when it starts with the given
 /// wrapper prefix. For example: `extract_inner_type("Vec<User>", "Vec<")` -> `Some("User")`
 pub fn extract_inner_type<'a>(type_str: &'a str, wrapper: &str) -> Option<&'a str> {
@@ -20,7 +28,7 @@ pub fn extract_inner_type<'a>(type_str: &'a str, wrapper: &str) -> Option<&'a st
 /// Get the content of the outermost generic (e.g., `Option<Vec<T>>` -> `Vec<T>`),
 /// or the type itself if it isn't generic. Whitespace is removed.
 pub fn strip_outer_generic(type_name: &str) -> String {
-    let clean = type_name.replace(' ', "");
+    let clean = normalize_type(type_name);
     match (clean.find('<'), clean.rfind('>')) {
         (Some(start), Some(end)) if start < end => clean[start + 1..end].to_string(),
         _ => clean,
@@ -29,7 +37,7 @@ pub fn strip_outer_generic(type_name: &str) -> String {
 
 /// Check if a type is a primitive type (not a custom enum/struct)
 pub fn is_primitive_type(type_name: &str) -> bool {
-    let clean = type_name.replace(" ", "");
+    let clean = normalize_type(type_name);
 
     let primitives = [
         "bool", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128",
@@ -65,7 +73,7 @@ const STD_GENERIC_WRAPPERS: [&str; 10] = [
 /// `Box` was misclassified as a custom type and drew a spurious "Unknown type"
 /// diagnostic while the same tuple embedding a `HashMap` did not.
 pub fn is_std_generic_type(type_name: &str) -> bool {
-    let clean = type_name.replace(" ", "");
+    let clean = normalize_type(type_name);
 
     STD_GENERIC_WRAPPERS
         .iter()

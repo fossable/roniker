@@ -432,7 +432,8 @@ fn create_explicit_field_type_action(
                 && value_node.kind() == "struct"
                 && ts_utils::struct_name(&value_node, content).is_none()
             {
-                let type_name = super::type_utils::short_name(&field.type_name).replace(' ', "");
+                let short = super::type_utils::short_name(&field.type_name);
+                let type_name = super::type_utils::normalize_type(short);
                 let clean_type = super::type_utils::extract_inner_type(&type_name, "Option<")
                     .unwrap_or(&type_name);
 
@@ -557,7 +558,7 @@ fn detect_current_variant_in_content(content: &str) -> Option<String> {
 
 /// Generate a default value for a given Rust type
 fn generate_default_value(type_name: &str) -> String {
-    let clean = type_name.replace(" ", "");
+    let clean = super::type_utils::normalize_type(type_name);
 
     if clean.starts_with("Option") {
         "None".to_string()

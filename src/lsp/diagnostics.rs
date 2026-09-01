@@ -2,7 +2,7 @@ use super::tree_sitter_parser;
 use super::ts_utils::ParsedEnumVariant;
 use super::type_utils::{
     closest_name, extract_inner_type, is_custom_type, is_primitive_type, missing_required_fields,
-    short_name,
+    normalize_type, short_name,
 };
 use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use ron::Value;
@@ -540,7 +540,7 @@ async fn validate_field_value_node<'a>(
     analyzer: &Arc<RustAnalyzer>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    let field_type_normalized = field_type.replace(" ", "");
+    let field_type_normalized = normalize_type(field_type);
 
     // Helper closure to emit an "Unknown type" diagnostic at the value node
     let unknown_type_diag = |inner: &str| Diagnostic {
@@ -811,7 +811,7 @@ async fn validate_variant_field_data(
     // For single-field tuple variants with Vec<CustomType>, use tree-sitter validation
     if expected_fields.len() == 1 {
         let field_type = &expected_fields[0].type_name;
-        let normalized_type = field_type.replace(" ", "");
+        let normalized_type = normalize_type(field_type);
 
         // Check if it's Vec<CustomType>
         if let Some(inner_type) = extract_inner_type(&normalized_type, "Vec<") {
@@ -1124,7 +1124,7 @@ fn check_type_mismatch_deep(
     content: &str,
     field_name: &str,
 ) -> Option<String> {
-    let clean_type = expected_type.replace(" ", "");
+    let clean_type = normalize_type(expected_type);
 
     // First check if it's a primitive type or standard library generic type
     if !is_custom_type(expected_type) {
@@ -1218,7 +1218,7 @@ fn extract_field_value_text(tree: Option<&Tree>, content: &str, field_name: &str
 
 /// Check if a RON value matches the expected Rust type
 fn check_type_mismatch(value: &Value, expected_type: &str) -> Option<String> {
-    let clean_type = expected_type.replace(" ", "");
+    let clean_type = normalize_type(expected_type);
     // Use clean_type for error messages to avoid extra spaces
     let display_type = &clean_type;
 
