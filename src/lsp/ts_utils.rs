@@ -171,35 +171,30 @@ pub fn named_children<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
     node.named_children(&mut cursor).collect()
 }
 
-/// Get the struct/variant name from a struct node
-/// Returns None if it's an anonymous struct (no identifier child)
-pub fn struct_name<'a>(node: &Node, content: &'a str) -> Option<&'a str> {
-    if node.kind() != "struct" {
+/// Get the text of a node's leading `identifier` child, if the node has the
+/// expected kind. Both `struct` and `field` nodes store their name this way.
+fn leading_identifier<'a>(node: &Node, content: &'a str, expected_kind: &str) -> Option<&'a str> {
+    if node.kind() != expected_kind {
         return None;
     }
 
-    // First child should be identifier if it's a named struct
-    if let Some(first_child) = node.child(0)
-        && first_child.kind() == "identifier"
-    {
-        return node_text(&first_child, content);
+    let first_child = node.child(0)?;
+    if first_child.kind() == "identifier" {
+        node_text(&first_child, content)
+    } else {
+        None
     }
-    None
+}
+
+/// Get the struct/variant name from a struct node
+/// Returns None if it's an anonymous struct (no identifier child)
+pub fn struct_name<'a>(node: &Node, content: &'a str) -> Option<&'a str> {
+    leading_identifier(node, content, "struct")
 }
 
 /// Get the field name from a field node
 pub fn field_name<'a>(node: &Node, content: &'a str) -> Option<&'a str> {
-    if node.kind() != "field" {
-        return None;
-    }
-
-    // First child should be the identifier
-    if let Some(first_child) = node.child(0)
-        && first_child.kind() == "identifier"
-    {
-        return node_text(&first_child, content);
-    }
-    None
+    leading_identifier(node, content, "field")
 }
 
 /// Get the value node from a field node
