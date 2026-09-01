@@ -991,7 +991,7 @@ fn extract_map_from_value(value: &Value) -> Option<&ron::Map> {
 /// Extract the variant name and data from raw RON text using tree-sitter
 /// Enums can be: Simple (Long), tuple (Long(...)), or struct-like (Long { ... })
 fn extract_enum_variant_from_text(content: &str) -> Option<ParsedEnumVariant> {
-    use super::ts_utils::{self, RonParser};
+    use super::ts_utils;
 
     // Skip type annotation if present
     let ron_content = if content.trim_start().starts_with("/*") {
@@ -1004,8 +1004,9 @@ fn extract_enum_variant_from_text(content: &str) -> Option<ParsedEnumVariant> {
         content
     };
 
-    let mut parser = RonParser::new();
-    let tree = parser.parse(ron_content)?;
+    // Reuse the thread-local parser instead of building a fresh one (which
+    // reloads the RON grammar) on every diagnostics pass.
+    let tree = ts_utils::parse(ron_content)?;
 
     // Find the main value (should be an identifier or struct representing the variant)
     let main_value = ts_utils::find_main_value(&tree);
