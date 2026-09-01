@@ -392,27 +392,7 @@ impl LanguageServer for Backend {
 
                 // Case 2: Hovering over a variant name
                 if let Some(variant) = type_info.find_variant(&word) {
-                    let mut hover_text = format!(
-                        "```rust\nenum {}\n```\n\n**Variant:** `{}`",
-                        type_utils::short_name(&type_info.name),
-                        variant.name
-                    );
-
-                    if let Some(ref docs) = variant.docs {
-                        hover_text.push_str(&format!("\n\n{}", docs));
-                    }
-
-                    if !variant.fields.is_empty() {
-                        hover_text.push_str("\n\n**Fields:**\n");
-                        for field in &variant.fields {
-                            hover_text
-                                .push_str(&format!("- `{}`: `{}`", field.name, field.type_name));
-                            if let Some(ref field_docs) = field.docs {
-                                hover_text.push_str(&format!(" - {}", field_docs));
-                            }
-                            hover_text.push('\n');
-                        }
-                    }
+                    let hover_text = format_variant_hover(&type_info.name, variant);
 
                     return Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
@@ -445,29 +425,7 @@ impl LanguageServer for Backend {
                     {
                         // Check if word is a variant of this field's type
                         if let Some(variant) = field_type_info.find_variant(&word) {
-                            let mut hover_text = format!(
-                                "```rust\nenum {}\n```\n\n**Variant:** `{}`",
-                                type_utils::short_name(&field_type_info.name),
-                                variant.name
-                            );
-
-                            if let Some(ref docs) = variant.docs {
-                                hover_text.push_str(&format!("\n\n{}", docs));
-                            }
-
-                            if !variant.fields.is_empty() {
-                                hover_text.push_str("\n\n**Fields:**\n");
-                                for vfield in &variant.fields {
-                                    hover_text.push_str(&format!(
-                                        "- `{}`: `{}`",
-                                        vfield.name, vfield.type_name
-                                    ));
-                                    if let Some(ref vfield_docs) = vfield.docs {
-                                        hover_text.push_str(&format!(" - {}", vfield_docs));
-                                    }
-                                    hover_text.push('\n');
-                                }
-                            }
+                            let hover_text = format_variant_hover(&field_type_info.name, variant);
 
                             return Ok(Some(Hover {
                                 contents: HoverContents::Markup(MarkupContent {
@@ -1094,6 +1052,34 @@ pub async fn serve(analyzer: RustAnalyzer, info_diagnostics: bool) {
     let (service, socket) =
         LspService::new(|client| Backend::new(client, analyzer, info_diagnostics));
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+/// Build the Markdown hover shown when the cursor is on an enum variant name,
+/// listing the variant's docs and any tuple/struct fields. `enum_type_name` is
+/// the fully-qualified name of the owning enum; only its last segment is shown.
+fn format_variant_hover(enum_type_name: &str, variant: &rust_analyzer::EnumVariant) -> String {
+    let mut hover_text = format!(
+        "```rust\nenum {}\n```\n\n**Variant:** `{}`",
+        type_utils::short_name(enum_type_name),
+        variant.name
+    );
+
+    if let Some(ref docs) = variant.docs {
+        hover_text.push_str(&format!("\n\n{}", docs));
+    }
+
+    if !variant.fields.is_empty() {
+        hover_text.push_str("\n\n**Fields:**\n");
+        for field in &variant.fields {
+            hover_text.push_str(&format!("- `{}`: `{}`", field.name, field.type_name));
+            if let Some(ref field_docs) = field.docs {
+                hover_text.push_str(&format!(" - {}", field_docs));
+            }
+            hover_text.push('\n');
+        }
+    }
+
+    hover_text
 }
 
 #[cfg(test)]
