@@ -1,6 +1,6 @@
 use super::tree_sitter_parser;
 use super::type_utils::{extract_inner_type, normalize_type, short_name, strip_outer_generic};
-use crate::rust_analyzer::{FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
+use crate::rust_analyzer::{EnumVariant, FieldInfo, RustAnalyzer, TypeInfo, TypeKind};
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent, MarkupKind,
@@ -238,11 +238,41 @@ fn generate_type_completions_for_field(
 
         // Try to get type info for this type
         if let Some(nested_type) = analyzer.get_type_info(&inner_type) {
+            // An enum field's value is a variant name, which the syntactic
+            // context detection can't tell apart from a struct type name (both
+            // are bare identifiers). Offer the variants rather than the enum
+            // type itself, matching the `FieldValue` path.
+            if let TypeKind::Enum(variants) = &nested_type.kind {
+                return enum_variant_value_completions(nested_type, variants);
+            }
             return vec![create_type_completion(nested_type)];
         }
     }
 
     Vec::new()
+}
+
+/// Completion items offering an enum's variants as RON values, using serialized
+/// names (honoring `#[serde(rename)]` / `rename_all`).
+fn enum_variant_value_completions(
+    type_info: &TypeInfo,
+    variants: &[EnumVariant],
+) -> Vec<CompletionItem> {
+    let rename_all = type_info.rename_all.as_deref();
+    variants
+        .iter()
+        .map(|variant| {
+            let name = variant.serialized_name(rename_all);
+            CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some(format!("Variant of {}", type_info.name)),
+                documentation: variant.docs.as_ref().map(|docs| markdown_docs(docs.clone())),
+                insert_text: Some(name),
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 /// Create a completion item for a type (struct or enum)
@@ -306,19 +336,7 @@ fn generate_value_completions_by_type(
         match &type_info.kind {
             TypeKind::Enum(variants) => {
                 // For enums, provide completions for each variant (serialized names)
-                let rename_all = type_info.rename_all.as_deref();
-                for variant in variants {
-                    let name = variant.serialized_name(rename_all);
-                    let completion = CompletionItem {
-                        label: name.clone(),
-                        kind: Some(CompletionItemKind::ENUM_MEMBER),
-                        detail: Some(format!("Variant of {}", type_info.name)),
-                        documentation: variant.docs.as_ref().map(|docs| markdown_docs(docs.clone())),
-                        insert_text: Some(name),
-                        ..Default::default()
-                    };
-                    completions.push(completion);
-                }
+                completions.extend(enum_variant_value_completions(type_info, variants));
                 return completions;
             }
             TypeKind::Struct(_) => {
@@ -559,6 +577,55 @@ mod tests {
         let variant_labels: Vec<String> = completions.iter().map(|c| c.label.clone()).collect();
         assert!(variant_labels.contains(&"UnitVariant".to_string()));
         assert!(variant_labels.contains(&"TupleVariant".to_string()));
+    }
+
+    #[test]
+    fn test_enum_field_value_completes_variants_not_type_name() {
+        // A struct field whose type is an enum. When the user starts typing the
+        // value (e.g. `mode: P`), the syntactic context is `StructType`, but the
+        // value they want is an enum variant, not the enum's type name.
+        let parent = TypeInfo {
+            name: "Config".to_string(),
+            kind: TypeKind::Struct(vec![FieldInfo {
+                name: "mode".to_string(),
+                type_name: "ServerMode".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let enum_type = TypeInfo {
+            name: "ServerMode".to_string(),
+            kind: TypeKind::Enum(vec![
+                EnumVariant {
+                    name: "Development".to_string(),
+                    ..Default::default()
+                },
+                EnumVariant {
+                    name: "Production".to_string(),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let mut analyzer = crate::rust_analyzer::RustAnalyzer::new();
+        analyzer.add_type(parent.clone());
+        analyzer.add_type(enum_type);
+        let analyzer = std::sync::Arc::new(analyzer);
+
+        let completions = generate_type_completions_for_field("mode".to_string(), &parent, analyzer);
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+        assert!(
+            labels.contains(&"Development") && labels.contains(&"Production"),
+            "enum variants should be offered as values: {:?}",
+            labels
+        );
+        assert!(
+            !labels.contains(&"ServerMode"),
+            "the enum type name is not a valid value and should not be offered: {:?}",
+            labels
+        );
     }
 
     #[test]
